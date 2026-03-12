@@ -1,0 +1,22 @@
+# Python virtual environment — too large to upload, recreated with pip install
+backend/venv/
+
+# Python compiled files — auto-generated, not needed
+backend/__pycache__/
+backend/*.pyc
+
+# React dependencies — too large to upload, recreated with npm install
+frontend/node_modules/
+
+# React production build — generated on demand, not source code
+frontend/build/
+
+# Environment variables — may contain secrets, never upload these
+*.env
+.env
+
+# Windows junk files
+Thumbs.db
+
+# Mac junk files
+.DS_Store
