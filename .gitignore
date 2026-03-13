@@ -20,3 +20,9 @@ Thumbs.db
 
 # Mac junk files
 .DS_Store
+
+# Security — never upload tokens or passwords
+GitHub Token for KindPDF.txt
+
+#Backend Uploads folder, idk why but I was told to put this here
+backend/uploads/
