@@ -2,7 +2,7 @@
 
 > This file is read by Claude at the start of every session.
 > Keep it updated. It is the project's memory.
-> Last updated: March 13, 2026
+> Last updated: March 18, 2026
 
 ---
 
@@ -78,10 +78,10 @@ kindpdf/
 │       ├── index.js       # React entry point
 │       ├── index.css      # Tailwind CSS imports
 │       └── components/
-│           ├── HomeScreen.js   # Drag and drop upload screen
-│           ├── PDFViewer.js    # Main viewer — manages state
-│           ├── Toolbar.js      # Page nav, zoom controls
-│           └── Sidebar.js      # Thumbnail sidebar
+│           ├── HomeScreen.js    # Drag and drop upload screen
+│           ├── PDFViewer.js     # Main viewer — manages all state
+│           ├── Toolbar.js       # Page nav, zoom, search controls
+│           └── Sidebar.js       # Thumbnail sidebar
 ├── .gitignore
 ├── CLAUDE.md
 ├── KindPDF_Task_List.docx
@@ -96,7 +96,19 @@ kindpdf/
 
 **Phase 0 complete:** ✅ Yes
 
-**Phase 1 complete:** ☐ No
+**Phase 1.1 complete:** ✅ Yes
+
+**Phase 1.2 complete:** ☐ No
+
+**Phase 1.3 complete:** ☐ No
+
+**Phase 1.4 complete:** ☐ No
+
+**Phase 1.5 complete:** ☐ No
+
+**Phase 1.6 complete:** ☐ No
+
+**Phase 1.7 complete:** ☐ No
 
 **Phase 2 complete:** ☐ No
 
@@ -113,82 +125,84 @@ kindpdf/
 - ✅ Home screen with drag and drop zone and Choose a File button
 - ✅ Plain English error messages for wrong file types
 - ✅ PDF opens and renders correctly using PDF.js
-- ✅ Page navigation — Previous / Next buttons
+- ✅ Continuous scroll — all pages render in one scrollable column
+- ✅ Page number in toolbar updates automatically as user scrolls
 - ✅ Jump to page by typing page number
-- ✅ Zoom In / Zoom Out / Fit to Screen (fit reads real page dimensions)
+- ✅ Zoom In / Zoom Out / Fit to Screen
+- ✅ Zoom persists across pages — never resets on navigation
 - ✅ Thumbnail sidebar — all pages, click to jump
 - ✅ Arrow key navigation
+- ✅ Word search — highlights matches in yellow across all pages
+- ✅ Search match counter ("2 of 14"), prev/next navigation
+- ✅ Active match highlighted in orange, others in yellow
+- ✅ Ctrl+F routes to KindPDF search bar instead of Chrome's
 - ✅ Loading spinner while PDF opens
 - ✅ Plain English error screen if PDF fails to load
-- ✅ Mobile responsive — sidebar hides on narrow screens, bottom nav appears
+- ✅ Mobile responsive — sidebar hides on narrow screens
 - ✅ Code is on GitHub at github.com/Gotkens/kindpdf
 
 ---
 
 ## What Is NOT Working / Known Issues
 
-- ☐ No continuous scroll — pages do not flow into each other. User must 
-  use thumbnails or toolbar to navigate between pages. This is the top 
-  priority for next session.
-- ☐ Zoom resets to fit-to-screen on initial load (acceptable) but must 
-  NOT reset when navigating between pages — fix as part of continuous 
-  scroll rebuild.
-- ☐ No word search within document yet (Phase 1.1 remaining item)
-- ☐ Docker not yet installed (needed for Phase 1 deployment)
+- ☐ No annotation tools yet (Phase 1.2 — next priority)
+- ☐ No signature tool yet (Phase 1.3)
+- ☐ No form filling yet (Phase 1.4)
+- ☐ No page management yet (Phase 1.5)
+- ☐ Docker not yet set up (Phase 1.7)
 
 ---
 
 ## Planned Features Not Yet Built (from design discussions)
 
 - Eraser tool needs TWO modes when annotation tools are built (Phase 1.2):
-  1. Brush eraser — erases entire pen stroke it touches (current default behavior)
+  1. Brush eraser — erases entire pen stroke it touches
   2. Fine eraser — erases only pixels it touches, with adjustable size
 - PWA support (Phase 2) — adds desktop icon, launches in own window, 
-  works offline. Makes app feel like a native desktop app for non-technical users.
+  works offline. Makes app feel like a native desktop app for 
+  non-technical users.
 
 ---
 
 ## Last Session Summary
 
-**Date:** March 13, 2026
+**Date:** March 18, 2026
 
-**What we did:** Built Phase 1.1 — PDF Viewer (partially complete)
+**What we did:** Completed Phase 1.1 — PDF Viewer
 
 **What was completed:**
-- Replaced Hello World backend with full PDF upload and serve endpoints
-- Built HomeScreen component — drag and drop, file picker, loading states,
-  plain English errors
-- Built PDFViewer component — PDF.js rendering, page and zoom state
-- Built Toolbar component — page nav, zoom controls, fit to screen
-- Built Sidebar component — thumbnail rendering, click to navigate
-- Installed pdfjs-dist, Tailwind CSS 3.4.1
-- Fixed PDF.js worker URL issue (was pointing to wrong CDN version —
-  switched to local node_modules worker file)
-- Fixed Fit to Screen (was using hardcoded 612px width — now reads real
-  page dimensions from PDF)
-- Created requirements.txt for Python dependencies
+- Rebuilt PDFViewer with continuous scroll architecture
+- All pages render in a single scrollable column
+- IntersectionObserver updates page number in toolbar as user scrolls
+- Zoom persists across pages and never resets on navigation
+- Fixed React Strict Mode double-render bug (cancelled flag + render 
+  task cancellation)
+- Built word search using PDF.js getTextContent()
+- Yellow highlights drawn on transparent overlay canvas above each page
+- Active match highlighted in orange, inactive in yellow
+- Match counter, prev/next navigation, scrolls directly to each match
+- Ctrl+F intercepted and routed to KindPDF search bar
+- Enter key advances through matches after initial search
+- Fixed prop name mismatches between App.js, PDFViewer.js, Toolbar.js
 
 **What was left unfinished:**
-- Continuous scroll (architectural change — needs its own focused session)
-- Word search within document
-
-**Any errors encountered:**
-- Tailwind v4 incompatible with init command — downgraded to v3.4.1
-- PDF.js worker CDN URL version mismatch — fixed by using local worker:
-  `new URL('pdfjs-dist/build/pdf.worker.mjs', import.meta.url).toString()`
-- Initial drag and drop test was accidentally testing Chrome's built-in 
-  PDF viewer, not KindPDF — confirmed working once identified
+- Nothing — Phase 1.1 is fully complete
 
 ---
 
 ## Next Session Goal
 
-Rebuild PDFViewer with continuous scroll as the foundation:
-- All pages render in a single scrollable column
-- Page number in toolbar updates automatically as user scrolls
-- Zoom level persists across pages and never resets except when 
-  Fit to Screen is clicked
-- Then complete remaining Phase 1.1 item: word search within document
+Build Phase 1.2 — Annotation Tools:
+- Highlight text in yellow, green, pink, or blue
+- Underline important text
+- Draw a line through text (strikethrough)
+- Add a sticky note comment anywhere on the page
+- Draw freehand with a pen tool
+- Add a text box — type anywhere on the page
+- Undo button — always visible, always works
+- Save annotations permanently into the PDF
+
+Remember: eraser needs TWO modes — brush eraser and fine pixel eraser.
 
 ---
 
@@ -196,8 +210,9 @@ Rebuild PDFViewer with continuous scroll as the foundation:
 
 | Date | What Was Accomplished |
 |---|---|
+| March 18, 2026 | Phase 1.1 complete — continuous scroll, word search, Ctrl+F |
 | March 13, 2026 | Phase 1.1 partial — PDF viewer working, continuous scroll pending |
-| March 12, 2026 | Phase 0 complete — full dev environment, Hello World app, pushed to GitHub |
+| March 12, 2026 | Phase 0 complete — full dev environment, Hello World, pushed to GitHub |
 
 ---
 
@@ -216,6 +231,9 @@ Rebuild PDFViewer with continuous scroll as the foundation:
 | PWA over Electron | Much simpler, smaller, same end-user experience for desktop icon/launch |
 | Tailwind v3.4.1 not v4 | Tailwind v4 removed the init command and changed config format — v3 is stable |
 | PDF.js worker from local node_modules | CDN version was mismatched — local file always matches installed version |
+| Continuous scroll architecture | Required for annotations — all pages must exist in DOM simultaneously |
+| Search highlights on overlay canvas | Keeps PDF render untouched; overlays are easy to clear and redraw |
+| Ctrl+F intercepted at window level | PDF text is on canvas — Chrome's built-in search can't find it anyway |
 
 ---
 
@@ -236,10 +254,10 @@ Rebuild PDFViewer with continuous scroll as the foundation:
 | Phase | Estimated Cost | Spent So Far |
 |---|---|---|
 | Phase 0 — Setup | ~$2–4 | ~$2 |
-| Phase 1 — MVP | ~$30–55 | ~$3 |
+| Phase 1 — MVP | ~$30–55 | ~$6 |
 | Phase 2 — Features | ~$25–45 | $0 |
 | Phase 3 — Enterprise | ~$17–28 | $0 |
-| **Total** | **~$74–132** | **~$5** |
+| **Total** | **~$74–132** | **~$8** |
 
 ---
 
@@ -258,19 +276,23 @@ Rebuild PDFViewer with continuous scroll as the foundation:
 
 1. Open PowerShell
 2. cd to backend folder
-3. Start backend: `.\venv\Scripts\Activate.ps1` → `python app.py`
+3. Activate venv and start Flask:
+   `.\venv\Scripts\Activate.ps1` → `python app.py`
 4. Open second PowerShell → cd to frontend folder → `npm start`
 5. Browser opens at http://localhost:3000
-6. Paste this CLAUDE.md into Claude with your session goal
-```
+6. Paste CLAUDE.md into Claude with your session goal
 
 ---
 
-**Before you shut down, do these two things:**
+## Before You Shut Down
 
-**1. Push to GitHub** — run these in your frontend PowerShell (stop npm first with Ctrl+C, then cd up to the root kindpdf folder):
-```
+**1. Push to GitHub:**
+```powershell
 cd ..
 git add .
-git commit -m "Phase 1.1 - PDF viewer working, continuous scroll pending"
+git commit -m "describe what you built"
 git push
+```
+
+**2. Update CLAUDE.md** — last session summary, next session goal, 
+session log, and anything new in the working/not working lists.
