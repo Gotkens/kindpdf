@@ -12,18 +12,23 @@ function App() {
   const [pdfFile, setPdfFile] = useState(null);  // URL to fetch from backend
   const [pdfName, setPdfName] = useState('');    // Display name for the title bar
 
+  // Store the backend filename so PDFViewer can send it back for save-annotations
+  const [pdfFilename, setPdfFilename] = useState('');
+
   // Called by HomeScreen when the user successfully uploads a PDF.
   // filename = the unique name the backend assigned
   // originalName = the human-readable filename (e.g. "my-contract.pdf")
   const handlePdfLoaded = (filename, originalName) => {
     setPdfFile(`http://localhost:5000/api/pdf/${filename}`);
     setPdfName(originalName);
+    setPdfFilename(filename);
   };
 
   // Called when the user clicks "Open a different file"
   const handleClose = () => {
     setPdfFile(null);
     setPdfName('');
+    setPdfFilename('');
   };
 
   return (
@@ -32,6 +37,7 @@ function App() {
         <PDFViewer
           pdfUrl={pdfFile}
           pdfName={pdfName}
+          pdfFilename={pdfFilename}
           onClose={handleClose}
         />
       ) : (

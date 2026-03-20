@@ -2,7 +2,7 @@
 
 > This file is read by Claude at the start of every session.
 > Keep it updated. It is the project's memory.
-> Last updated: March 18, 2026
+> Last updated: March 20, 2026
 
 ---
 
@@ -78,10 +78,13 @@ kindpdf/
 │       ├── index.js       # React entry point
 │       ├── index.css      # Tailwind CSS imports
 │       └── components/
-│           ├── HomeScreen.js    # Drag and drop upload screen
-│           ├── PDFViewer.js     # Main viewer — manages all state
-│           ├── Toolbar.js       # Page nav, zoom, search controls
-│           └── Sidebar.js       # Thumbnail sidebar
+│           ├── HomeScreen.js         # Drag and drop upload screen
+│           ├── PDFViewer.js          # Main viewer — manages all state
+│           ├── Toolbar.js            # Page nav, zoom, search controls
+│           ├── Sidebar.js            # Thumbnail sidebar
+│           ├── AnnotationToolbar.js  # Secondary annotation tools toolbar
+│           ├── StickyNoteOverlay.js  # HTML overlay for sticky notes (hover popup)
+│           └── TextBoxOverlay.js     # HTML overlay for text boxes (draggable, editable)
 ├── .gitignore
 ├── CLAUDE.md
 ├── KindPDF_Task_List.docx
@@ -98,7 +101,7 @@ kindpdf/
 
 **Phase 1.1 complete:** ✅ Yes
 
-**Phase 1.2 complete:** ☐ No
+**Phase 1.2 complete:** ✅ Yes
 
 **Phase 1.3 complete:** ☐ No
 
@@ -119,6 +122,24 @@ kindpdf/
 ## What Is Working Right Now
 
 - ✅ Flask backend runs on port 5000
+- ✅ Annotation toolbar (always visible below main toolbar)
+- ✅ Highlight tool — browser-style drag selection, 4 colors + custom; binary opacity (no stacking)
+- ✅ Underline tool — browser-style drag selection, 4 colors + custom
+- ✅ Cross Out (strikethrough) tool — browser-style drag selection, 4 colors + custom
+- ✅ Add Note (sticky) tool — click to place, type note, click "Add Note" to save; shows as 📝 icon
+- ✅ Clicking existing sticky note icon while Add Note tool is active opens it for editing (not new note)
+- ✅ Sticky note hover popup — read, edit (✏️ or double-click), delete (✕), drag to move
+- ✅ Add Text (textbox) tool — click to place, font family + size dropdowns, draggable, double-click to edit, ✕ to delete
+- ✅ Bold and underline toggles for text boxes (B / U buttons in toolbar)
+- ✅ Draw (pen) tool — freehand drawing with adjustable size and 4 colors + custom
+- ✅ Erase tool — two modes: Whole (removes entire annotation) and Fine (erases segments/rects), adjustable size
+- ✅ Fine eraser shows dashed blue circle cursor; erases highlight/underline/strikethrough rect-by-rect
+- ✅ Undo — removes last annotation, Ctrl+Z shortcut
+- ✅ Save As PDF — embeds all annotations into the PDF, opens native Save As dialog
+- ✅ Highlights saved to PDF use merged rects — no opacity stacking in Acrobat regardless of overlap
+- ✅ Sticky notes saved as native PDF annotations (real sticky notes in Acrobat/Preview, not drawn graphics)
+- ✅ All annotation coordinates normalized so they survive zoom changes
+- ✅ PyMuPDF (fitz) used on backend for permanently writing annotations to PDF
 - ✅ React frontend runs on port 3000
 - ✅ PDF upload endpoint — accepts PDF, stores with unique filename
 - ✅ PDF serving endpoint — serves stored PDF back to frontend
@@ -145,7 +166,7 @@ kindpdf/
 
 ## What Is NOT Working / Known Issues
 
-- ☐ No annotation tools yet (Phase 1.2 — next priority)
+- ☐ No annotation round-trip (see Planned Features below for full build plan)
 - ☐ No signature tool yet (Phase 1.3)
 - ☐ No form filling yet (Phase 1.4)
 - ☐ No page management yet (Phase 1.5)
@@ -153,11 +174,59 @@ kindpdf/
 
 ---
 
-## Planned Features Not Yet Built (from design discussions)
+## Planned Features Not Yet Built
 
-- Eraser tool needs TWO modes when annotation tools are built (Phase 1.2):
-  1. Brush eraser — erases entire pen stroke it touches
-  2. Fine eraser — erases only pixels it touches, with adjustable size
+### Annotation Round-Trip (build before Phase 1.3)
+
+When a PDF is opened that already contains native PDF annotations (saved 
+by KindPDF previously, or added in Acrobat/Preview), those annotations 
+should load back into KindPDF as fully editable annotations — not flat 
+graphics.
+
+**Why it matters:** KindPDF now saves sticky notes as native PDF annotations.
+Without round-trip reading, reopening a saved PDF in KindPDF shows no notes.
+
+**What to build:**
+
+**Backend — new endpoint:**
+```
+GET /api/annotations/<filename>
+```
+Opens the PDF with PyMuPDF, reads all existing annotations, returns them 
+as JSON in KindPDF's annotation format. Annotation type mapping:
+
+| PDF annotation type | KindPDF type | PyMuPDF annot.type value |
+|---|---|---|
+| Text (sticky note) | sticky | fitz.PDF_ANNOT_TEXT (0) |
+| Highlight | highlight | fitz.PDF_ANNOT_HIGHLIGHT (8) |
+| Underline | underline | fitz.PDF_ANNOT_UNDERLINE (9) |
+| StrikeOut | strikethrough | fitz.PDF_ANNOT_STRIKEOUT (11) |
+| Ink (freehand) | pen | fitz.PDF_ANNOT_INK (15) |
+| FreeText | textbox | fitz.PDF_ANNOT_FREE_TEXT (2) |
+
+For each annotation, return:
+- page number (1-based)
+- type (mapped to KindPDF type)
+- coordinates converted to normalized scale=1 points
+- color as rgba string
+- text content where applicable
+
+**Frontend — PDFViewer.js:**
+After PDF loads successfully (inside the loadingTask.promise.then block),
+call `GET /api/annotations/<filename>`. If annotations come back, call
+`setAnnotationHistory` to seed the present state with them — exactly as
+if the user had just drawn them. They then behave as fully editable,
+undoable, saveable annotations.
+
+**Honest limitation:** Annotations created in other apps (Acrobat, Preview)
+may have slight coordinate differences due to different coordinate systems.
+Text and position will be correct; pixel-perfect alignment not guaranteed
+for textboxes created elsewhere.
+
+---
+
+### Other Planned Features
+
 - PWA support (Phase 2) — adds desktop icon, launches in own window, 
   works offline. Makes app feel like a native desktop app for 
   non-technical users.
@@ -166,43 +235,76 @@ kindpdf/
 
 ## Last Session Summary
 
-**Date:** March 18, 2026
+**Date:** March 20, 2026 (bug fixes + annotation improvements)
 
-**What we did:** Completed Phase 1.1 — PDF Viewer
+**What we did:** Fixed a crash bug in PDFViewer.js, fixed highlight opacity 
+in saved PDFs, added click-to-edit existing sticky notes, and upgraded sticky 
+note saving to native PDF annotations.
 
 **What was completed:**
-- Rebuilt PDFViewer with continuous scroll architecture
-- All pages render in a single scrollable column
-- IntersectionObserver updates page number in toolbar as user scrolls
-- Zoom persists across pages and never resets on navigation
-- Fixed React Strict Mode double-render bug (cancelled flag + render 
-  task cancellation)
-- Built word search using PDF.js getTextContent()
-- Yellow highlights drawn on transparent overlay canvas above each page
-- Active match highlighted in orange, inactive in yellow
-- Match counter, prev/next navigation, scrolls directly to each match
-- Ctrl+F intercepted and routed to KindPDF search bar
-- Enter key advances through matches after initial search
-- Fixed prop name mismatches between App.js, PDFViewer.js, Toolbar.js
+
+- Fixed PDFViewer.js crash on PDF open:
+  `findAndAccumulateTextAtPoint` (old function name, removed in Round 4) was 
+  still referenced in the `useCallback` dependency array of `handleAnnotationMouseDown`.
+  Fixed by replacing it with the correct current name: `findTextInRange`.
+  Change is one word on one line — the deps array at the bottom of that callback.
+
+- Fixed highlight opacity stacking in saved PDFs (app.py):
+  Added `merge_rects_into_lines()` helper — same algorithm as the frontend's 
+  `mergeRectsIntoLines`. Added `collect_highlight_rects()` which gathers all 
+  highlight rects across all annotations on a page, groups by color, and merges 
+  them before drawing. In the save route, highlights are now drawn before the 
+  main annotation loop using merged rects. The main loop skips highlights with 
+  `continue`. Result: each pixel painted exactly once regardless of how many 
+  times user dragged over it — opacity matches what KindPDF shows on screen.
+
+- Added click-to-edit existing sticky notes while Add Note tool is active:
+  PDFViewer.js: added `openStickyId` state. In `handleAnnotationMouseDown` sticky 
+  branch, added a hit-test that checks if the click lands within an existing note's 
+  26×26px icon bounds (normalized by scale). If hit: sets `openStickyId` to that 
+  note's id instead of creating a new one. `interactionDisabled` prop on 
+  StickyNoteOverlay now also allows `activeTool === 'sticky'` through.
+  StickyNoteOverlay.js: added `openForEdit` and `onOpenHandled` props. A useEffect 
+  watches `openForEdit` — when true, opens popup in edit mode immediately and calls 
+  `onOpenHandled()` to reset the parent's state.
+
+- Upgraded sticky note saving to native PDF annotations (app.py):
+  Replaced the entire flat-drawing block (~40 lines of draw_rect + insert_text) 
+  with 6 lines using `page.add_text_annot()`. Notes now save as real PDF "Text" 
+  annotations. In Acrobat/Preview/any PDF reader: appears as a clickable icon, 
+  opens into an editable popup, can be deleted without affecting page content.
+  Color set to amber/yellow to match KindPDF's visual style.
+
+**Architecture notes:**
+- Highlight merge happens server-side at save time, not on every annotation change.
+  The frontend still stores individual annotation objects (needed for undo granularity).
+  Merging only at save time means undo still works word-by-word as expected.
+- Native PDF annotation round-trip not yet built — see Planned Features above.
+  Sticky notes saved as native annotations will not reappear as editable notes 
+  when the PDF is reopened in KindPDF until round-trip reading is implemented.
 
 **What was left unfinished:**
-- Nothing — Phase 1.1 is fully complete
+- Annotation round-trip reading (documented above — build before Phase 1.3)
 
 ---
 
 ## Next Session Goal
 
-Build Phase 1.2 — Annotation Tools:
-- Highlight text in yellow, green, pink, or blue
-- Underline important text
-- Draw a line through text (strikethrough)
-- Add a sticky note comment anywhere on the page
-- Draw freehand with a pen tool
-- Add a text box — type anywhere on the page
-- Undo button — always visible, always works
-- Save annotations permanently into the PDF
+**Option A (recommended):** Build annotation round-trip reading first — 
+see Planned Features section above for the full spec. This is a small, 
+self-contained backend endpoint + one useEffect in PDFViewer.js. Completing 
+it makes the sticky note native annotation feature fully coherent.
 
-Remember: eraser needs TWO modes — brush eraser and fine pixel eraser.
+**Option B:** Skip to Phase 1.3 — Signature Tool:
+- Guided step-by-step flow (Step 1 of 3, etc.)
+- Three ways to sign: draw with mouse/finger, type name, upload image
+- Drag the signature to position it on any page
+- Resize the signature
+- Save the signed PDF (download)
+
+Remember: the signature tool is the feature most critical for the 
+"75-year-old grandma" use case — it must be the simplest, most guided 
+experience in the entire app.
 
 ---
 
@@ -210,6 +312,11 @@ Remember: eraser needs TWO modes — brush eraser and fine pixel eraser.
 
 | Date | What Was Accomplished |
 |---|---|
+| March 20, 2026 | Bug fix + polish: PDFViewer crash fix, highlight opacity fix in saved PDF, click-to-edit sticky notes, native PDF sticky note saving |
+| March 20, 2026 | Round 4 polish: Save As fix, binary highlights, browser-style selection, sticky note edit, bold/underline text, fine eraser on rects, eraser circle cursor |
+| March 20, 2026 | Round 3 polish: continuous highlight spans, sticky note drag+delay, direct text box placement, live font/size/color on selected box, 20 fonts |
+| March 20, 2026 | Annotation polish: word-level selection, sticky/textbox HTML overlays, explicit commit buttons, font controls |
+| March 20, 2026 | Phase 1.2 complete — annotation toolbar, all 7 tools, undo, save PDF |
 | March 18, 2026 | Phase 1.1 complete — continuous scroll, word search, Ctrl+F |
 | March 13, 2026 | Phase 1.1 partial — PDF viewer working, continuous scroll pending |
 | March 12, 2026 | Phase 0 complete — full dev environment, Hello World, pushed to GitHub |
@@ -234,6 +341,8 @@ Remember: eraser needs TWO modes — brush eraser and fine pixel eraser.
 | Continuous scroll architecture | Required for annotations — all pages must exist in DOM simultaneously |
 | Search highlights on overlay canvas | Keeps PDF render untouched; overlays are easy to clear and redraw |
 | Ctrl+F intercepted at window level | PDF text is on canvas — Chrome's built-in search can't find it anyway |
+| Sticky notes saved as native PDF annotations | Enables real interactivity in Acrobat/Preview; flat drawn boxes were dead graphics |
+| Highlight merge at save time only | Frontend keeps individual objects for undo granularity; merge only when writing to PDF |
 
 ---
 
@@ -254,10 +363,10 @@ Remember: eraser needs TWO modes — brush eraser and fine pixel eraser.
 | Phase | Estimated Cost | Spent So Far |
 |---|---|---|
 | Phase 0 — Setup | ~$2–4 | ~$2 |
-| Phase 1 — MVP | ~$30–55 | ~$6 |
+| Phase 1 — MVP | ~$30–55 | ~$14 |
 | Phase 2 — Features | ~$25–45 | $0 |
 | Phase 3 — Enterprise | ~$17–28 | $0 |
-| **Total** | **~$74–132** | **~$8** |
+| **Total** | **~$74–132** | **~$16** |
 
 ---
 
