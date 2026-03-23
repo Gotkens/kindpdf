@@ -1,12 +1,14 @@
 # backend/app.py
 # KindPDF — Flask Backend
 # Phase 1.2: Annotation saving added
+# Annotation round-trip: reading added
 #
 # Routes:
 #   GET  /api/hello                — health check (Phase 0)
 #   POST /api/upload               — receive a PDF, return it for viewing
 #   GET  /api/pdf/<filename>       — serve a stored PDF file
 #   POST /api/save-annotations     — embed annotations into PDF, return for download
+#   GET  /api/annotations/<filename> — read existing native PDF annotations for round-trip loading
 
 import os
 import uuid
@@ -137,6 +139,49 @@ def parse_fill_opacity(color_str):
     return 1.0
 
 
+def _fitz_color_to_rgba(colors_dict, kind):
+    """
+    Convert a PyMuPDF annotation's colors dict to a CSS rgba() string.
+
+    colors_dict has 'stroke' and 'fill' keys; each is either None or a
+    (r, g, b) tuple with values in the 0.0–1.0 range.
+
+    Highlights get 0.45 opacity to match what KindPDF shows on screen.
+    All other types default to fully opaque.
+    """
+    stroke = colors_dict.get('stroke')
+    fill   = colors_dict.get('fill')
+    rgb    = stroke or fill or (0, 0, 0)
+    r, g, b = (int(c * 255) for c in rgb)
+    if kind == 'highlight':
+        return f'rgba({r},{g},{b},0.45)'
+    return f'rgba({r},{g},{b},1)'
+
+
+def _annot_quads_to_rects(vertices):
+    """
+    Convert a list of PyMuPDF quad vertices to KindPDF rect dicts.
+
+    PDF markup annotations (highlight, underline, strikethrough) store
+    their geometry as a flat list of quad corners — 4 vertices per region.
+    We convert each quad to its axis-aligned bounding rect in PDF points,
+    matching the {x, y, w, h} format that the frontend already uses.
+    """
+    rects = []
+    if not vertices or len(vertices) < 4:
+        return rects
+    for i in range(0, len(vertices), 4):
+        quad = vertices[i:i + 4]
+        if len(quad) < 4:
+            break
+        xs = [p[0] for p in quad]
+        ys = [p[1] for p in quad]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        rects.append({'x': x0, 'y': y0, 'w': x1 - x0, 'h': y1 - y0})
+    return rects
+
+
 @app.route('/api/hello')
 def hello():
     """Health check endpoint from Phase 0."""
@@ -179,6 +224,135 @@ def upload_pdf():
 def serve_pdf(filename):
     """Serve a stored PDF file back to the browser for rendering."""
     return send_from_directory(UPLOAD_FOLDER, filename)
+
+
+@app.route('/api/annotations/<filename>')
+def get_annotations(filename):
+    """
+    Read existing native PDF annotations from a stored file and return them
+    as a JSON array in KindPDF's annotation format.
+
+    Called by the frontend immediately after a PDF finishes loading, so any
+    annotations that were previously saved (as native PDF annotation objects)
+    reappear as fully editable, undoable annotations when the file is re-opened.
+
+    PyMuPDF annotation type integers → KindPDF type strings:
+      0  → "sticky"        (PDF Text — the sticky-note icon)
+      2  → "textbox"       (PDF FreeText)
+      8  → "highlight"     (PDF Highlight)
+      9  → "underline"     (PDF Underline)
+      11 → "strikethrough" (PDF StrikeOut)
+      15 → "pen"           (PDF Ink — freehand drawing)
+
+    Returns an empty JSON array (not an error) if:
+      - The file has no native annotations
+      - The file does not exist
+      - Any error occurs during reading
+    This ensures the PDF always opens cleanly even if round-trip loading fails.
+
+    Coordinate note: PyMuPDF uses the same top-left origin as the KindPDF
+    frontend. Coordinates are returned in PDF points at scale=1, matching the
+    format that drawSingleAnnotation() and the save route already use.
+    """
+    try:
+        import fitz
+    except ImportError:
+        return jsonify({'error': 'PyMuPDF is required for annotation reading.'}), 500
+
+    safe_filename = secure_filename(filename)
+    filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
+
+    # Return an empty array gracefully if the file isn't there — the PDF still opens clean.
+    if not os.path.exists(filepath):
+        return jsonify([])
+
+    # Map PyMuPDF type integers to KindPDF type strings.
+    TYPE_MAP = {
+        0:  'sticky',
+        2:  'textbox',
+        8:  'highlight',
+        9:  'underline',
+        11: 'strikethrough',
+        15: 'pen',
+    }
+
+    loaded_annotations = []
+    try:
+        doc = fitz.open(filepath)
+        for page_idx in range(doc.page_count):
+            page    = doc[page_idx]
+            page_num = page_idx + 1  # KindPDF uses 1-based page numbers
+
+            for ann_idx, annot in enumerate(page.annots()):
+                type_int = annot.type[0]
+                kind     = TYPE_MAP.get(type_int)
+                if kind is None:
+                    continue  # Skip annotation types KindPDF doesn't know about
+
+                text_content = annot.info.get('content', '') or ''
+                color_str    = _fitz_color_to_rgba(annot.colors, kind)
+
+                ann_obj = {
+                    'id':    f'loaded-{page_num}-{ann_idx}',
+                    'type':  kind,
+                    'page':  page_num,
+                    'color': color_str,
+                    'text':  text_content,
+                }
+
+                if kind == 'sticky':
+                    # The icon's top-left corner is the placement point.
+                    ann_obj['x']        = annot.rect.x0
+                    ann_obj['y']        = annot.rect.y0
+                    ann_obj['fontSize'] = 12
+
+                elif kind == 'textbox':
+                    # FreeText: top-left of the annotation rect.
+                    # Font size was stored in the subject field at save time for exact recovery.
+                    ann_obj['x'] = annot.rect.x0
+                    ann_obj['y'] = annot.rect.y0
+                    subject = annot.info.get('subject', '') or ''
+                    try:
+                        ann_obj['fontSize'] = int(float(subject))
+                    except (ValueError, TypeError):
+                        ann_obj['fontSize'] = 14  # Fallback for textboxes from other apps
+
+                elif kind in ('highlight', 'underline', 'strikethrough'):
+                    # Markup annotations store geometry as quad vertices (4 pts per region).
+                    verts = annot.vertices
+                    if verts:
+                        ann_obj['rects'] = _annot_quads_to_rects(verts)
+                    else:
+                        # Fall back to bounding rect if no vertices present.
+                        r = annot.rect
+                        ann_obj['rects'] = [{'x': r.x0, 'y': r.y0,
+                                             'w': r.x1 - r.x0, 'h': r.y1 - r.y0}]
+
+                elif kind == 'pen':
+                    # PyMuPDF Ink annotation vertices are a list of strokes, where each
+                    # stroke is itself a list of (x, y) point pairs — NOT a flat list of
+                    # points. We flatten all strokes into one point list because KindPDF
+                    # stores each pen stroke as a single annotation with one point list.
+                    # (We write one Ink annotation per KindPDF pen stroke at save time,
+                    # so there will always be exactly one stroke in annot.vertices here.)
+                    # Stroke width was stored via set_border at save time and is recovered here.
+                    points = []
+                    if annot.vertices:
+                        for stroke in annot.vertices:      # outer loop: each stroke
+                            for pt in stroke:              # inner loop: each point in stroke
+                                points.append({'x': pt[0], 'y': pt[1]})
+                    ann_obj['points'] = points
+                    ann_obj['width']  = annot.border.get('width', 2)
+
+                loaded_annotations.append(ann_obj)
+
+        doc.close()
+
+    except Exception as e:
+        print(f'KindPDF: error reading annotations from {safe_filename}: {e}')
+        return jsonify([])  # Return empty array — PDF still opens clean
+
+    return jsonify(loaded_annotations)
 
 
 @app.route('/api/save-annotations', methods=['POST'])
@@ -240,152 +414,147 @@ def save_annotations():
 
             page = doc[page_num]
 
-            # ── Highlights: merge all rects across all highlight annotations
-            # of the same color BEFORE drawing, so each pixel is painted exactly
-            # once. This prevents opacity stacking when the user dragged over the
-            # same area multiple times (the frontend fixes this visually; we must
-            # fix it here so the saved PDF matches).
-            highlight_rects_by_color = collect_highlight_rects(page_annotations)
-            for color_str, merged_rects in highlight_rects_by_color.items():
-                fill_color = parse_color(color_str)
-                opacity = parse_fill_opacity(color_str)
-                for r in merged_rects:
-                    rect = fitz.Rect(r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h'])
-                    page.draw_rect(
-                        rect,
-                        fill=fill_color,
-                        fill_opacity=min(opacity, 0.45),
-                        width=0,
-                        overlay=True
-                    )
-
+            # ── All annotation types are now written as native PDF annotation objects.
+            # This replaces the previous flat-graphics approach (draw_rect / draw_line /
+            # insert_text / Shape). Native annotations are invisible to PDF.js's canvas
+            # renderer (which is suppressed via annotationMode: 0 on the frontend), are
+            # readable by any standards-compliant PDF viewer, and — crucially — are
+            # picked up by GET /api/annotations/<filename> for full round-trip editing.
             for ann in page_annotations:
-                ann_type = ann.get('type')
-                color = parse_color(ann.get('color', '#000000'))
-                opacity = parse_fill_opacity(ann.get('color', ''))
+                ann_type  = ann.get('type')
+                color_rgb = parse_color(ann.get('color', '#000000'))
+                opacity   = parse_fill_opacity(ann.get('color', ''))
 
-                # ── Highlight — already drawn above via merged rects; skip here ──
+                # ── Highlight ──
+                # Native PDF Highlight annotation. Each KindPDF highlight becomes one
+                # annotation whose quads are the merged rects for that annotation object.
+                # Opacity is capped at 0.45 to match what KindPDF shows on screen.
                 if ann_type == 'highlight':
-                    continue
+                    rects = ann.get('rects', [])
+                    if rects:
+                        quads = [
+                            fitz.Rect(r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h']).quad
+                            for r in rects
+                        ]
+                        hl = page.add_highlight_annot(quads)
+                        hl.set_colors(stroke=color_rgb)
+                        hl.set_opacity(min(opacity, 0.45))
+                        hl.update()
 
                 # ── Underline ──
+                # Native PDF Underline annotation. Quads are built from the word-level rects.
                 elif ann_type == 'underline':
-                    for r in ann.get('rects', []):
-                        y = r['y'] + r['h']
-                        page.draw_line(
-                            fitz.Point(r['x'], y),
-                            fitz.Point(r['x'] + r['w'], y),
-                            color=color,
-                            width=1.5
-                        )
+                    rects = ann.get('rects', [])
+                    if rects:
+                        quads = [
+                            fitz.Rect(r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h']).quad
+                            for r in rects
+                        ]
+                        ul = page.add_underline_annot(quads)
+                        ul.set_colors(stroke=color_rgb)
+                        ul.update()
 
                 # ── Strikethrough ──
+                # Native PDF StrikeOut annotation.
                 elif ann_type == 'strikethrough':
-                    for r in ann.get('rects', []):
-                        y = r['y'] + r['h'] * 0.55
-                        page.draw_line(
-                            fitz.Point(r['x'], y),
-                            fitz.Point(r['x'] + r['w'], y),
-                            color=color,
-                            width=1.5
-                        )
+                    rects = ann.get('rects', [])
+                    if rects:
+                        quads = [
+                            fitz.Rect(r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h']).quad
+                            for r in rects
+                        ]
+                        st = page.add_strikeout_annot(quads)
+                        st.set_colors(stroke=color_rgb)
+                        st.update()
 
                 # ── Pen / freehand drawing ──
+                # Native PDF Ink annotation. Each KindPDF pen stroke becomes one Ink annot
+                # with a single ink list. Stroke width is stored via set_border so it
+                # survives the round-trip (read back as annot.border['width']).
                 elif ann_type == 'pen':
-                    points = ann.get('points', [])
+                    points    = ann.get('points', [])
                     pen_width = ann.get('width', 2)
                     if len(points) >= 2:
-                        # Use a Shape so we can draw a connected polyline with proper line joins.
-                        # Page.draw_line() does not support round caps — Shape.finish() does.
-                        pts = [fitz.Point(p['x'], p['y']) for p in points]
-                        shape = page.new_shape()
-                        shape.draw_polyline(pts)
-                        shape.finish(color=color, width=pen_width, closePath=False)
-                        shape.commit()
+                        # add_ink_annot requires plain (x, y) float tuples, not fitz.Point objects
+                        ink_list = [[(p['x'], p['y']) for p in points]]
+                        ink = page.add_ink_annot(ink_list)
+                        ink.set_colors(stroke=color_rgb)
+                        ink.set_border(width=pen_width)
+                        ink.update()
 
                 # ── Text box ──
+                # Native PDF FreeText annotation. The bounding rect is estimated from the
+                # text content and font size (same sizing heuristic as the frontend uses).
+                # Font size is stored in the annotation's subject field so it can be read
+                # back exactly on round-trip reload.
                 elif ann_type == 'textbox':
-                    x = ann.get('x', 0)
-                    y = ann.get('y', 0)
-                    text = ann.get('text', '')
+                    x         = ann.get('x', 0)
+                    y         = ann.get('y', 0)
+                    text      = ann.get('text', '')
                     font_size = ann.get('fontSize', 14)
-                    is_bold = ann.get('isBold', False)
-                    is_underline = ann.get('isUnderline', False)
-                    # Use built-in bold font when requested; helv = Helvetica, hebo = Helvetica Bold
-                    fontname = 'hebo' if is_bold else 'helv'
+                    is_bold   = ann.get('isBold', False)
+                    fontname  = 'hebo' if is_bold else 'helv'
                     if text:
-                        lines = text.split('\n')
-                        line_height = font_size * 1.4
-                        for i, line in enumerate(lines):
-                            if not line:
-                                continue
-                            baseline_y = y + i * line_height
-                            page.insert_text(
-                                fitz.Point(x, baseline_y),
-                                line,
-                                fontsize=font_size,
-                                fontname=fontname,
-                                color=color
-                            )
-                            # Draw underline as a line just below the baseline
-                            if is_underline:
-                                approx_width = len(line) * font_size * 0.55
-                                page.draw_line(
-                                    fitz.Point(x, baseline_y + 2),
-                                    fitz.Point(x + approx_width, baseline_y + 2),
-                                    color=color,
-                                    width=1
-                                )
+                        lines      = text.split('\n')
+                        max_chars  = max(len(l) for l in lines) if lines else 1
+                        char_width = font_size * 0.55
+                        box_w      = max(max_chars * char_width + 16, 80)
+                        box_h      = len(lines) * font_size * 1.4 + 10
+                        rect       = fitz.Rect(x, y, x + box_w, y + box_h)
+                        tb = page.add_freetext_annot(
+                            rect,
+                            text,
+                            fontsize=font_size,
+                            fontname=fontname,
+                            text_color=color_rgb,
+                            fill_color=None,   # transparent background
+                            rotate=0,
+                            align=0
+                        )
+                        # Store font size in subject so the round-trip loader can restore it.
+                        tb.set_info(subject=str(font_size))
+                        tb.update()
 
                 # ── Sticky note ──
+                # Saved as a native PDF "Text" annotation (the standard sticky-note object).
+                # In any PDF reader (Acrobat, Preview, etc.) this appears as a clickable icon
+                # that opens into an editable popup — not a flat drawn graphic.
+                # This also enables round-trip loading: the GET /api/annotations endpoint
+                # reads these back as editable KindPDF sticky notes on re-open.
                 elif ann_type == 'sticky':
-                    x = ann.get('x', 0)
-                    y = ann.get('y', 0)
+                    x    = ann.get('x', 0)
+                    y    = ann.get('y', 0)
                     text = ann.get('text', '')
-                    font_size = ann.get('fontSize', 12)
                     if text:
-                        lines = text.split('\n')
-                        # Estimate box dimensions
-                        char_width = font_size * 0.55
-                        max_line_len = max(len(l) for l in lines) if lines else 1
-                        box_w = max(max_line_len * char_width + 16, 80)
-                        header_h = 18
-                        line_height = font_size * 1.4
-                        box_h = header_h + len(lines) * line_height + 10
+                        sticky_annot = page.add_text_annot(
+                            fitz.Point(x, y),
+                            text,
+                            icon='Note'
+                        )
+                        # Amber/yellow colour to match KindPDF's on-screen style.
+                        # update() is required after set_colors — without it PyMuPDF does not
+                        # write the changed appearance stream back to the annotation object,
+                        # which causes the icon to be invisible in thumbnails and PDF viewers.
+                        sticky_annot.set_colors(stroke=(0.99, 0.85, 0.20))
+                        sticky_annot.update()
 
-                        # Yellow background
-                        box_rect = fitz.Rect(x, y, x + box_w, y + box_h)
-                        page.draw_rect(
-                            box_rect,
-                            fill=(1.0, 0.98, 0.76),
-                            fill_opacity=0.95,
-                            color=(0.85, 0.47, 0.04),
-                            width=1.5
-                        )
-                        # Header strip
-                        header_rect = fitz.Rect(x, y, x + box_w, y + header_h)
-                        page.draw_rect(
-                            header_rect,
-                            fill=(0.99, 0.90, 0.54),
-                            fill_opacity=0.9,
-                            color=(0.85, 0.47, 0.04),
-                            width=0.5
-                        )
-                        # Header label
-                        page.insert_text(
-                            fitz.Point(x + 4, y + header_h - 4),
-                            'NOTE',
-                            fontsize=9,
-                            color=(0.57, 0.25, 0.04)
-                        )
-                        # Note text lines
-                        for i, line in enumerate(lines):
-                            page.insert_text(
-                                fitz.Point(x + 6, y + header_h + 8 + (i + 1) * line_height),
-                                line,
-                                fontsize=font_size,
-                                color=(0.11, 0.10, 0.10)
-                            )
+                elif ann_type == 'signature':
+                    # Signatures are saved as embedded images in the PDF.
+                    # The dataUrl is a PNG/JPEG base64 string from the canvas (draw mode)
+                    # or a typed/uploaded image. We decode and use page.insert_image() to
+                    # place it at the annotation's bounding rect.
+                    import base64
+                    x        = ann.get('x', 0)
+                    y        = ann.get('y', 0)
+                    width    = ann.get('width', 200)
+                    height   = ann.get('height', 80)
+                    data_url = ann.get('dataUrl', '')
+                    if data_url and ',' in data_url:
+                        # Strip the "data:image/png;base64," prefix
+                        image_bytes = base64.b64decode(data_url.split(',', 1)[1])
+                        rect = fitz.Rect(x, y, x + width, y + height)
+                        # keep_proportion=False fills the rect exactly as positioned by the user
+                        page.insert_image(rect, stream=image_bytes, keep_proportion=False)
 
         # Save annotated PDF to a new file
         output_filename = f'annotated_{safe_filename}'

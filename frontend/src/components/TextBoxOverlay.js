@@ -162,6 +162,13 @@ export default function TextBoxOverlay({
   };
 
   const handleBlur = () => {
+    // If this is a brand-new, still-empty textbox, don't auto-commit on blur.
+    // The user might be clicking the font/size/color controls in the toolbar to
+    // configure the text BEFORE they start typing. Auto-committing here would
+    // immediately delete the empty box and make it impossible to change the font.
+    // They can still cancel with Esc or close by clicking elsewhere after typing.
+    if (isNewlyPlacedRef.current && !editText.trim()) return;
+
     // Small timeout so "Done" button onMouseDown fires first
     setTimeout(() => {
       if (isEditingRef.current) commitEdit();

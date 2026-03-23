@@ -4,7 +4,8 @@
 // Secondary toolbar with annotation tools and a full color picker.
 // Design rules: every button has icon + text label, tooltip on every button.
 
-import React from 'react';
+import React, { useState, useRef, useEffect } from 'react';
+import { FONT_FAMILY_MAP } from './TextBoxOverlay';
 
 export const HIGHLIGHT_COLORS = [
   { name: 'Yellow', value: 'rgba(255, 235, 59, 0.45)', solid: '#FCD34D' },
@@ -68,6 +69,86 @@ const FONT_FAMILIES = [
 
 const FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 48, 60, 72];
 
+// ── FontFamilyDropdown ────────────────────────────────────────────────────────
+// A custom dropdown that renders each font option in its own typeface.
+// Native <select>/<option> ignores fontFamily CSS in most browsers, making all
+// options look identical. This component uses a positioned list instead.
+function FontFamilyDropdown({ value, onChange, fonts }) {
+  const [open, setOpen]     = useState(false);
+  const containerRef        = useRef(null);
+
+  // Close the dropdown when user clicks anywhere outside it
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e) => {
+      if (containerRef.current && !containerRef.current.contains(e.target)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  const current = fonts.find(f => f.value === value) || fonts[0];
+  const cssCurrent = FONT_FAMILY_MAP[current.value] || current.value;
+
+  return (
+    <div ref={containerRef} className="relative">
+      {/* Trigger button — shows current font name in its own typeface */}
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        title="Choose a font style for your text — each option is shown in its own typeface"
+        aria-label="Font family"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        className="flex items-center gap-1 border border-gray-200 rounded px-2 py-0.5 bg-white hover:bg-gray-50 focus:outline-none focus:ring-1 focus:ring-blue-400 text-gray-700 min-w-[110px] justify-between"
+        style={{ fontSize: 13 }}
+      >
+        <span style={{ fontFamily: cssCurrent, fontSize: 14 }}>{current.label}</span>
+        <svg className="w-3 h-3 text-gray-400 flex-shrink-0 ml-1" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <path d="M6 9l6 6 6-6"/>
+        </svg>
+      </button>
+
+      {/* Dropdown list */}
+      {open && (
+        <div
+          role="listbox"
+          aria-label="Font family options"
+          className="absolute top-full left-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-50 overflow-y-auto"
+          style={{ minWidth: 180, maxHeight: 260 }}
+        >
+          {fonts.map(f => {
+            const cssFamily = FONT_FAMILY_MAP[f.value] || f.value;
+            const isSelected = f.value === value;
+            return (
+              <button
+                key={f.value}
+                role="option"
+                aria-selected={isSelected}
+                type="button"
+                onMouseDown={(e) => {
+                  e.preventDefault(); // prevent textarea blur
+                  onChange(f.value);
+                  setOpen(false);
+                }}
+                className={`w-full text-left px-3 py-1.5 hover:bg-blue-50 transition-colors ${
+                  isSelected ? 'bg-blue-50 text-blue-700' : 'text-gray-800'
+                }`}
+                style={{ fontFamily: cssFamily, fontSize: 15 }}
+                title={`Use ${f.label} font`}
+              >
+                {f.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function AnnotationToolbar({
   activeTool,
   onToolChange,
@@ -81,6 +162,8 @@ export default function AnnotationToolbar({
   onEraserSizeChange,
   canUndo,
   onUndo,
+  canRedo,
+  onRedo,
   onSave,
   isSaving,
   textFontFamily,
@@ -195,6 +278,25 @@ export default function AnnotationToolbar({
         'Click anywhere to type text directly on the page'
       )}
 
+      {/* ── Sign ── */}
+      {/* The signature "tool" opens a wizard modal rather than activating a persistent
+          drawing mode, so it uses a plain button instead of toolBtn() to avoid
+          showing as "active" after the modal closes. */}
+      <button
+        onClick={() => onToolChange('signature')}
+        title="Add your signature to the document — opens a guided step-by-step wizard"
+        aria-label="Add signature"
+        className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-sm font-medium transition-all select-none text-gray-700 hover:bg-white hover:shadow-sm"
+      >
+        <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+          <path d="M20 19.5v.5a2 2 0 01-2 2H6a2 2 0 01-2-2V4a2 2 0 012-2h8.5L18 5.5"/>
+          <path d="M8 13c0-1.1.9-2 2-2s2 .9 2 2-.9 2-2 2-2-.9-2-2z" fill="currentColor" opacity="0.2"/>
+          <path d="M6 17c1-2 2.5-3 4-3s3 1.5 3 3" strokeLinecap="round"/>
+          <path d="M17 3l2 2-8.5 8.5-3 .5.5-3L17 3z"/>
+        </svg>
+        <span className="hidden sm:inline whitespace-nowrap">Sign</span>
+      </button>
+
       <div className="w-px h-5 bg-amber-300 mx-1" aria-hidden="true" />
 
       {/* ── Pen / Draw ── */}
@@ -225,17 +327,11 @@ export default function AnnotationToolbar({
           <span className="text-xs text-amber-700 font-medium hidden sm:block">
             {hasSelectedTextBox && activeTool !== 'textbox' ? 'Selected text:' : 'Font:'}
           </span>
-          <select
+          <FontFamilyDropdown
             value={textFontFamily}
-            onChange={e => onTextFontFamilyChange(e.target.value)}
-            title="Choose a font style for your text"
-            aria-label="Font family"
-            className="text-xs border border-gray-200 rounded px-1 py-0.5 bg-white text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-400"
-          >
-            {FONT_FAMILIES.map(f => (
-              <option key={f.value} value={f.value}>{f.label}</option>
-            ))}
-          </select>
+            onChange={onTextFontFamilyChange}
+            fonts={FONT_FAMILIES}
+          />
           <select
             value={textFontSize}
             onChange={e => onTextFontSizeChange(Number(e.target.value))}
@@ -395,6 +491,20 @@ export default function AnnotationToolbar({
           <path d="M21 17a9 9 0 00-9-9 9 9 0 00-6 2.3L3 13"/>
         </svg>
         <span className="hidden sm:inline">Undo</span>
+      </button>
+
+      {/* ── Redo ── */}
+      <button
+        onClick={onRedo} disabled={!canRedo}
+        title="Redo the last undone annotation (Ctrl+Y)"
+        aria-label="Redo last undone annotation"
+        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${canRedo ? 'text-gray-700 hover:bg-white hover:shadow-sm' : 'text-gray-300 cursor-not-allowed'}`}
+      >
+        <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+          <path d="M21 7v6h-6"/>
+          <path d="M3 17a9 9 0 019-9 9 9 0 016 2.3l3 2.7"/>
+        </svg>
+        <span className="hidden sm:inline">Redo</span>
       </button>
 
       {/* ── Save As ── */}

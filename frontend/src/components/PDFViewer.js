@@ -16,6 +16,8 @@ import Sidebar from './Sidebar';
 import AnnotationToolbar, { HIGHLIGHT_COLORS, LINE_COLORS } from './AnnotationToolbar';
 import StickyNoteOverlay from './StickyNoteOverlay';
 import TextBoxOverlay from './TextBoxOverlay';
+import SignatureModal from './SignatureModal';
+import SignatureOverlay from './SignatureOverlay';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.mjs',
@@ -280,8 +282,8 @@ export default function PDFViewer({ pdfUrl, pdfName, pdfFilename, onClose }) {
   const [allMatches, setAllMatches] = useState([]);
   const [searchMatchIndex, setSearchMatchIndex] = useState(0);
 
-  // --- Annotation state (past/present pattern for clean undo) ---
-  const [annotationHistory, setAnnotationHistory] = useState({ past: [], present: {} });
+  // --- Annotation state (past/present/future pattern for undo + redo) ---
+  const [annotationHistory, setAnnotationHistory] = useState({ past: [], present: {}, future: [] });
 
   // Annotation tool settings
   const [activeTool, setActiveTool] = useState(null);
@@ -309,6 +311,17 @@ export default function PDFViewer({ pdfUrl, pdfName, pdfFilename, onClose }) {
 // Which sticky note (by id) should open in edit mode — set when user clicks
 // an existing note while the sticky tool is active. Resets after the overlay handles it.
 const [openStickyId, setOpenStickyId] = useState(null);
+
+  // ── Signature state ──────────────────────────────────────────────────────
+  // signatureModalOpen: shows the 3-step signature creation wizard
+  // pendingSignature: holds { dataUrl, width, height } while the user is picking
+  //   where to place it on the page. Cleared after placement.
+  const [signatureModalOpen, setSignatureModalOpen]   = useState(false);
+  const [pendingSignature, setPendingSignature]       = useState(null);
+  // Ref mirror — lets handleAnnotationMouseDown (a useCallback) access pendingSignature
+  // without needing it in its dependency array (avoids re-binding on every render).
+  const pendingSignatureRef = useRef(null);
+  useEffect(() => { pendingSignatureRef.current = pendingSignature; }, [pendingSignature]);
 
   // Active text input overlay (sticky note only)
   const [activeInput, setActiveInput] = useState(null);
@@ -366,11 +379,44 @@ const [openStickyId, setOpenStickyId] = useState(null);
     const loadingTask = pdfjsLib.getDocument(pdfUrl);
 
     loadingTask.promise
-      .then(doc => {
+      .then(async doc => {
         if (cancelled) return;
         setPdfDoc(doc);
         setNumPages(doc.numPages);
         setIsLoading(false);
+
+        // ── Annotation round-trip: load existing native PDF annotations ──
+        // After the PDF is ready, ask the backend to read any native annotation
+        // objects that were previously saved (e.g. sticky notes saved by KindPDF,
+        // or annotations added in Acrobat / Preview). If any come back, seed the
+        // annotation history so they appear as fully editable annotations immediately.
+        // A fetch failure is silently ignored — the PDF simply opens clean.
+        if (pdfFilename) {
+          try {
+            const res = await fetch(
+              `http://localhost:5000/api/annotations/${encodeURIComponent(pdfFilename)}`
+            );
+            if (cancelled) return;
+            if (res.ok) {
+              const loaded = await res.json();
+              if (cancelled) return;
+              if (Array.isArray(loaded) && loaded.length > 0) {
+                // Group annotations by 1-based page number to match annotationHistory.present
+                // format: { pageNum: [annotation, annotation, ...] }
+                const grouped = {};
+                loaded.forEach(ann => {
+                  const p = ann.page;
+                  if (!grouped[p]) grouped[p] = [];
+                  grouped[p].push(ann);
+                });
+                setAnnotationHistory({ past: [], present: grouped, future: [] });
+              }
+            }
+          } catch (err) {
+            // Silently ignore — the PDF opens clean if annotations can't be loaded
+            console.warn('KindPDF: could not load saved annotations:', err);
+          }
+        }
       })
       .catch(err => {
         if (cancelled) return;
@@ -421,7 +467,11 @@ const [openStickyId, setOpenStickyId] = useState(null);
       canvas.height = viewport.height;
       context.clearRect(0, 0, canvas.width, canvas.height);
 
-      const renderTask = page.render({ canvasContext: context, viewport });
+      // annotationMode: 0 suppresses PDF.js from drawing native annotation icons
+      // (e.g. the sticky-note appearance stream) onto the canvas. KindPDF loads
+      // and displays all annotations itself via its own overlays, so this prevents
+      // double-rendering and the "flattened yellow box" artefact on re-open.
+      const renderTask = page.render({ canvasContext: context, viewport, annotationMode: 0 });
       renderTasksRef.current[pageNum] = renderTask;
       await renderTask.promise;
       renderTasksRef.current[pageNum] = null;
@@ -525,6 +575,7 @@ const [openStickyId, setOpenStickyId] = useState(null);
       if (e.key === 'ArrowDown' || e.key === 'ArrowRight') scrollToPage(Math.min(currentPage + 1, numPages));
       else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') scrollToPage(Math.max(currentPage - 1, 1));
       else if ((e.ctrlKey || e.metaKey) && e.key === 'z') handleUndo();
+      else if ((e.ctrlKey || e.metaKey) && e.key === 'y') handleRedo();
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
@@ -655,6 +706,7 @@ const [openStickyId, setOpenStickyId] = useState(null);
         ...prev.present,
         [pageNum]: [...(prev.present[pageNum] || []), { ...annotation, id: annId }],
       },
+      future: [], // Any new action clears the redo stack
     }));
     return annId; // synchronous return; setState is batched but annId is determined now
   }, []);
@@ -662,7 +714,22 @@ const [openStickyId, setOpenStickyId] = useState(null);
   const handleUndo = useCallback(() => {
     setAnnotationHistory(prev => {
       if (prev.past.length === 0) return prev;
-      return { past: prev.past.slice(0, -1), present: prev.past[prev.past.length - 1] };
+      return {
+        past:    prev.past.slice(0, -1),
+        present: prev.past[prev.past.length - 1],
+        future:  [prev.present, ...(prev.future || [])], // Save current state so Redo can restore it
+      };
+    });
+  }, []);
+
+  const handleRedo = useCallback(() => {
+    setAnnotationHistory(prev => {
+      if (!prev.future || prev.future.length === 0) return prev;
+      return {
+        past:    [...prev.past, prev.present],
+        present: prev.future[0],
+        future:  prev.future.slice(1),
+      };
     });
   }, []);
 
@@ -672,8 +739,9 @@ const [openStickyId, setOpenStickyId] = useState(null);
       const pageAnns = prev.present[pageNum] || [];
       const newAnns = pageAnns.map(a => a.id === annId ? { ...a, ...updates } : a);
       return {
-        past: [...prev.past, prev.present],
+        past:    [...prev.past, prev.present],
         present: { ...prev.present, [pageNum]: newAnns },
+        future:  [], // User action clears redo stack
       };
     });
   }, []);
@@ -684,13 +752,15 @@ const [openStickyId, setOpenStickyId] = useState(null);
       const pageAnns = prev.present[pageNum] || [];
       const newAnns = pageAnns.filter(a => a.id !== annId);
       return {
-        past: [...prev.past, prev.present],
+        past:    [...prev.past, prev.present],
         present: { ...prev.present, [pageNum]: newAnns },
+        future:  [], // User action clears redo stack
       };
     });
   }, []);
 
   const canUndo = annotationHistory.past.length > 0;
+  const canRedo = (annotationHistory.future || []).length > 0;
 
 
   // ============================================================
@@ -699,13 +769,23 @@ const [openStickyId, setOpenStickyId] = useState(null);
 
   const handleToolChange = useCallback(tool => {
     setActiveInput(null);
-    setActiveTool(tool);
     setSelectedTextBox(null); // deselect any text box when switching tools
     setNewTextBoxId(null);
     if (tool === 'highlight') setActiveColor(HIGHLIGHT_COLORS[0].value);
     else if (tool === 'underline' || tool === 'strikethrough') setActiveColor(LINE_COLORS[0].value);
     else if (tool === 'pen' || tool === 'sticky') setActiveColor('#1a1a1a');
     else if (tool === 'textbox') setActiveColor('#1a1a1a'); // textbox color defaults to black
+
+    // The signature "tool" immediately opens the creation wizard rather than
+    // activating a persistent drawing mode. We don't set activeTool to 'signature'
+    // until the user has actually created one and is ready to place it.
+    if (tool === 'signature') {
+      setSignatureModalOpen(true);
+      setActiveTool(null); // no persistent tool mode while wizard is open
+      return;
+    }
+
+    setActiveTool(tool);
   }, []);
 
   // Color change — for highlight tools, wrap hex colors in rgba with opacity.
@@ -929,6 +1009,26 @@ else if (activeTool === 'sticky') {
       activePageRef.current = pageNum;
       if (applyEraserRef.current) applyEraserRef.current(normX, normY, pageNum);
     }
+
+    else if (activeTool === 'signature_place') {
+      // User clicked a page to place the pending signature.
+      // Centre the signature on the click point.
+      const sig = pendingSignatureRef.current;
+      if (!sig) return;
+      const halfW = sig.width  / 2;
+      const halfH = sig.height / 2;
+      addAnnotation(pageNum, {
+        type: 'signature',
+        x: normX - halfW,
+        y: normY - halfH,
+        width:  sig.width,
+        height: sig.height,
+        dataUrl: sig.dataUrl,
+      });
+      setPendingSignature(null);
+      setActiveTool(null);
+    }
+
 }, [activeTool, findTextInRange, drawSelectionPreviewOnCanvas]);
 
   // Draw the eraser size circle on the cursor-canvas overlay.
@@ -1073,7 +1173,7 @@ else if (activeTool === 'sticky') {
         // Whole mode: remove entire annotations the cursor touches
         const newAnns = pageAnns.filter(ann => !annotationHitTest(ann, normX, normY, normRadius));
         if (newAnns.length === pageAnns.length) return prev;
-        return { past: [...prev.past, prev.present], present: { ...prev.present, [pageNum]: newAnns } };
+        return { past: [...prev.past, prev.present], present: { ...prev.present, [pageNum]: newAnns }, future: [] };
 
       } else {
         // Fine eraser: pixel-level erasure inside the cursor circle.
@@ -1139,7 +1239,7 @@ else if (activeTool === 'sticky') {
         });
 
         if (!changed) return prev;
-        return { past: [...prev.past, prev.present], present: { ...prev.present, [pageNum]: newAnns } };
+        return { past: [...prev.past, prev.present], present: { ...prev.present, [pageNum]: newAnns }, future: [] };
       }
     });
   }, []); // No deps: reads eraserMode/eraserSize through refs
@@ -1301,6 +1401,7 @@ else if (activeTool === 'sticky') {
     if (activeTool === 'pen') return 'crosshair';
     if (activeTool === 'eraser') return eraserMode === 'fine' ? 'none' : 'cell';
     if (activeTool === 'textbox' || activeTool === 'sticky') return 'text';
+    if (activeTool === 'signature_place') return 'copy'; // crosshair-ish "place here" cursor
     if (['highlight', 'underline', 'strikethrough'].includes(activeTool)) return 'text';
     return 'default';
   };
@@ -1359,6 +1460,7 @@ else if (activeTool === 'sticky') {
         eraserMode={eraserMode} onEraserModeChange={setEraserMode}
         eraserSize={eraserSize} onEraserSizeChange={setEraserSize}
         canUndo={canUndo} onUndo={handleUndo}
+        canRedo={canRedo} onRedo={handleRedo}
         onSave={handleSavePdf} isSaving={isSaving}
         textFontFamily={textFontFamily} onTextFontFamilyChange={handleTextFontFamilyChange}
         textFontSize={textFontSize} onTextFontSizeChange={handleTextFontSizeChange}
@@ -1367,10 +1469,32 @@ else if (activeTool === 'sticky') {
         hasSelectedTextBox={!!selectedTextBox}
       />
 
+      {/* ── Signature placement banner ──────────────────────────────────────
+          Shown while activeTool === 'signature_place'. Prompts the user to
+          click on the document to position their signature.
+      ── */}
+      {activeTool === 'signature_place' && pendingSignature && (
+        <div className="bg-blue-600 text-white px-4 py-2.5 flex items-center justify-between gap-4 shadow-sm">
+          <div className="flex items-center gap-2.5">
+            <span className="text-lg">✍️</span>
+            <span className="text-sm font-medium">
+              Click anywhere on the document to place your signature
+            </span>
+          </div>
+          <button
+            onClick={() => { setPendingSignature(null); setActiveTool(null); }}
+            title="Cancel — go back without placing the signature"
+            className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-white/20 hover:bg-white/30 text-sm font-medium transition-colors"
+          >
+            ✕ Cancel
+          </button>
+        </div>
+      )}
+
       <div className="flex flex-1 overflow-hidden">
 
         {sidebarOpen && (
-          <Sidebar pdfDoc={pdfDoc} numPages={numPages} currentPage={currentPage} onPageSelect={scrollToPage} />
+          <Sidebar pdfDoc={pdfDoc} numPages={numPages} currentPage={currentPage} onGoToPage={scrollToPage} />
         )}
 
         <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-auto bg-gray-200">
@@ -1500,12 +1624,45 @@ else if (activeTool === 'sticky') {
                   ))
                 }
 
+                {/* ── Signature HTML overlays (drag to move, corner handles to resize) ── */}
+                {(annotations[pageNum] || [])
+                  .filter(ann => ann.type === 'signature')
+                  .map(ann => (
+                    <SignatureOverlay
+                      key={ann.id}
+                      ann={ann}
+                      scale={scale}
+                      eraserActive={activeTool === 'eraser'}
+                      interactionDisabled={!!(activeTool && activeTool !== 'eraser' && activeTool !== 'signature_place')}
+                      onDelete={() => deleteAnnotation(pageNum, ann.id)}
+                      onUpdate={updates => updateAnnotation(pageNum, ann.id, updates)}
+                    />
+                  ))
+                }
+
               </div>
             ))}
           </div>
         </div>
 
       </div>
+
+      {/* ── Signature creation wizard modal ──────────────────────────── */}
+      {signatureModalOpen && (
+        <SignatureModal
+          onComplete={sig => {
+            // sig = { dataUrl, width, height }
+            // Store the signature and switch to placement mode
+            setSignatureModalOpen(false);
+            setPendingSignature(sig);
+            setActiveTool('signature_place');
+          }}
+          onCancel={() => {
+            setSignatureModalOpen(false);
+          }}
+        />
+      )}
+
     </div>
   );
 }
