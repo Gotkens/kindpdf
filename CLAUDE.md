@@ -2,7 +2,7 @@
 
 > This file is read by Claude at the start of every session.
 > Keep it updated. It is the project's memory.
-> Last updated: March 23, 2026
+> Last updated: March 24, 2026
 
 ---
 
@@ -86,7 +86,9 @@ kindpdf/
 │           ├── StickyNoteOverlay.js  # HTML overlay for sticky notes (hover popup)
 │           ├── TextBoxOverlay.js     # HTML overlay for text boxes (draggable, editable)
 │           ├── SignatureModal.js     # 3-step signature creation wizard (draw/type/upload)
-│           └── SignatureOverlay.js   # HTML overlay for placed signatures (drag + resize)
+│           ├── SignatureOverlay.js   # HTML overlay for placed signatures (drag + resize)
+│           ├── ConfirmDialog.js      # Reusable confirmation modal (used by page delete)
+│           └── MergeModal.js        # 2-step merge wizard (upload second PDF + pick insert position)
 ├── .gitignore
 ├── CLAUDE.md
 ├── KindPDF_Task_List.docx
@@ -109,7 +111,7 @@ kindpdf/
 
 **Phase 1.4 complete:** ☐ No
 
-**Phase 1.5 complete:** ☐ No
+**Phase 1.5 complete:** ✅ Yes
 
 **Phase 1.6 complete:** ☐ No
 
@@ -172,15 +174,26 @@ kindpdf/
 - ✅ Signature placement: blue banner prompts user to click where to place it
 - ✅ SignatureOverlay: drag to reposition, 4 corner handles to resize (aspect-ratio locked)
 - ✅ Signature save: embedded as image in PDF via PyMuPDF page.insert_image()
+- ✅ Delete page — sidebar button with inline confirmation; undo works; cannot delete last page
+- ✅ Rotate page — rotate left/right buttons per thumbnail; visual + saved via PyMuPDF set_rotation()
+- ✅ Reorder pages — drag-and-drop thumbnails in sidebar; live preview; undo works
+- ✅ Extract pages — select pages with checkboxes → "Save as New File" downloads extracted PDF
+- ✅ Merge PDFs — "Insert Another PDF" wizard: upload second PDF, choose insertion point, viewer reloads
+- ✅ All page operations staged in frontend state until Save As PDF
+- ✅ Page undo/redo stack (separate from annotation undo/redo; buttons visible in management mode)
+- ✅ Toolbar shows display page number (position in page order) not original page number after reorder/delete
+- ✅ Rotation round-trip — saved rotations persist correctly when PDF is re-opened (PDF.js intrinsic + additional rotation composed correctly)
+- ✅ Compact organize-mode thumbnails — two-column horizontal layout (~90px per card) shows many pages at once
+- ✅ Auto-scroll during drag — sidebar scrolls when cursor is within 80px of top/bottom edge, enabling moves across the full document
+- ✅ Multi-page group drag — selecting multiple pages and dragging any one moves the entire group together in relative order
 
 ---
 
 ## What Is NOT Working / Known Issues
 
-- ☐ No annotation round-trip (see Planned Features below for full build plan)
 - ☐ Signature round-trip not yet built — saved signatures are embedded as flat images and will not reload as editable overlays on re-open (signatures are rarely edited after placement; acceptable for Phase 1.3)
-- ☐ No form filling yet (Phase 1.4)
-- ☐ No page management yet (Phase 1.5)
+- ☐ No form filling yet (Phase 1.4) — next phase
+- ☐ Annotation coordinates for rotated pages: annotations placed BEFORE rotation may visually shift. Annotations placed AFTER rotation work correctly.
 - ☐ Docker not yet set up (Phase 1.7)
 
 ---
@@ -246,69 +259,66 @@ for textboxes created elsewhere.
 
 ## Last Session Summary
 
-**Date:** March 23, 2026 (Phase 1.3 Signature Tool + polish fixes)
+**Date:** March 24, 2026 (Phase 1.5 — Page Management + Bug Fixes)
 
-**What we did:** Built the complete Phase 1.3 Signature Tool (annotation round-trip,
-Redo button, signature wizard, placement, resize, save), then fixed 6 follow-up bugs
-reported after testing.
+**What we did:** Built the complete Phase 1.5 Page Management feature set, then fixed three bugs reported after initial testing.
 
-**What was completed:**
+**Architecture — staged page changes:**
+- `pageHistory` state in `PDFViewer.js` uses the same past/present/future undo pattern
+  as `annotationHistory`. `present = { pageOrder: [1,2,...N], pageRotations: {origPageNum: degrees} }`.
+- `pageOrder` drives the main render loop (replacing `Array.from({length: numPages})`).
+- All page operations are staged in frontend state until Save As PDF.
+- At save time, `pageOrder` and `pageRotations` are sent to the backend alongside annotations.
 
-**Annotation round-trip reading:**
-- New backend endpoint `GET /api/annotations/<filename>` — reads all native PDF
-  annotations via PyMuPDF `page.annots()` and returns them as KindPDF JSON objects.
-- All annotation types converted to native PDF objects at save time.
-- Frontend: after PDF loads, fetches the endpoint and seeds `annotationHistory.present`.
-- Added `annotationMode: 0` to `page.render()` — prevents yellow sticky artefact.
+**Backend changes (`app.py`):**
+- `POST /api/save-annotations` updated: accepts `pageOrder` (array of 1-based orig page nums
+  in new order) and `pageRotations` (`{origPageNum: degrees}`). Uses `doc.select()` to
+  reorder/delete, `page.set_rotation()` for rotation, and remaps annotation page numbers
+  from original → new positions using `orig_to_new_idx` dict.
+- `POST /api/extract-pages` — `{filename, pageNums}` → extracts subset of pages via
+  `doc.select()`, returns new PDF as download.
+- `POST /api/merge-pdf` — `{baseFilename, mergeFilename, insertAfterPage}` → merges second
+  PDF at specified position using `base_doc.insert_pdf()`, saves to new temp file, returns
+  `{success, filename, numPages}`.
 
-**Redo button:**
-- AnnotationToolbar.js: Redo button after Undo; Ctrl+Y shortcut.
+**New frontend components:**
+- `ConfirmDialog.js` — reusable confirmation modal (icon + title + message + Cancel + Confirm).
+- `MergeModal.js` — 2-step merge wizard: Step 1 choose file (uploads to backend), Step 2
+  pick insertion position (dropdown). After merge, viewer reloads with merged file.
 
-**Phase 1.3 — Signature Tool:**
-- `SignatureModal.js` — 3-step wizard (Draw / Type / Upload + optional date stamp).
-- `SignatureOverlay.js` — draggable, 4-corner-resizable overlay; eraser support.
-- `app.py` — `elif ann_type == 'signature':` embeds image via `page.insert_image()`.
-- `PDFViewer.js` — modal state, `signature_place` tool mode, blue placement banner.
-- `AnnotationToolbar.js` — Sign button.
+**Updated components:**
+- `Sidebar.js` — full rewrite:
+  - "Organize Pages" toggle button in header switches to management mode
+  - Compact management layout: two-column horizontal cards (~90px tall), thumbnail left + controls right
+  - Thumbnails cached by `origPageNum-additionalRot` key; cache cleared when pdfDoc changes
+  - Rotation rendering: `totalRot = (page.rotate + additionalRot) % 360` — respects PDF intrinsic rotation
+  - Drag-and-drop reorder via HTML5 drag API (no external library)
+  - Auto-scroll via `requestAnimationFrame` when cursor within 80px of sidebar top/bottom edge
+  - `handleDrop` passes `selectedPages` as third arg to `onReorderPages` for group moves
+  - Per-thumbnail: "↺ Left", "↻ Right" (rotate), 🗑️ (delete with inline confirm) buttons
+  - Selection checkboxes for extract; "Save N Pages as New File" button when selected
+  - Page undo/redo buttons visible in management mode
+  - "Insert Another PDF" merge button
+  - Footer shows total page count
+- `PDFViewer.js`:
+  - `activePdfUrl` / `activePdfFilename` internal state (starts from props; merge updates them)
+  - `pageHistory` with past/present/future undo stack
+  - `pageOrder` drives render loop; `pageRotations` passed to `renderPage()`
+  - `renderPage()` rotation fix: `totalRotation = (page.rotate + additionalRotation) % 360` passed to `getViewport`
+  - `handleReorderPages` supports group moves: when dragged page is in selectedPages (size > 1), all selected move together
+  - Page management handlers: `handleDeletePage`, `handleRotatePage`, `handleReorderPages`,
+    `handleSelectPage`, `handleExtractPages`, `handleMergeComplete`, `handlePageUndo`, `handlePageRedo`
+  - Toolbar shows display position (pageOrder.indexOf(currentPage)+1) not original page number
+  - Page management mode banner (amber) shown when managing pages
+  - `MergeModal` rendered at bottom of component tree
 
-**Phase 1.3 polish fixes (second pass):**
+**Bug fixes applied:**
+1. **Rotation not round-trip** — PDF.js `getViewport({ rotation: 0 })` was overriding the PDF's baked-in rotation. Fixed by computing `totalRotation = (page.rotate + additionalRotation) % 360` in both `renderPage` (PDFViewer.js) and thumbnail rendering (Sidebar.js).
+2. **Thumbnails too large in organize mode** — Redesigned management cards to horizontal two-column layout (~90px vs ~240px before); more pages visible, easier to drag.
+3. **No auto-scroll + no group drag** — Added `requestAnimationFrame` auto-scroll on sidebar `onDragOver`; updated `handleDrop` to pass `selectedPages` and `handleReorderPages` to move entire selection as a group.
 
-1. Draw signature gaps — `SignatureModal.js`: Added `lastPosRef` to track the endpoint
-   of each stroke. Each `mousemove` draws an explicit segment from last→current position
-   so fast mouse movement never leaves a gap.
-
-2. Date stamp not working — `SignatureModal.js`: Root cause: step-2 canvases unmount
-   when wizard advances to step 3, making refs null. Fix: `goToStep3()` now captures
-   the data URL into `capturedDataUrl` state BEFORE calling `setStep(3)`. `buildPreview`
-   reads from that captured URL, not from dead refs. Date stamp now correctly composites
-   text beneath the signature image.
-
-3. Typed font previews all looked identical — `SignatureModal.js`: Two bugs: (a) Google
-   Fonts CSS2 API requires `family=X&family=Y` params, not `|` separator — no fonts were
-   loading. (b) Canvas rendered before fonts were ready. Fixed: corrected URL format;
-   added `fontsReady` state via `document.fonts.ready.then(...)` which re-triggers the
-   canvas draw effect once fonts are available.
-
-4. Signature placement size too large — `SignatureModal.js`: Reduced `defaultWidth`
-   from 300 → 150 PDF points (~2 inches; ~1/4 of a letter page). Corner handles allow
-   resizing after placement.
-
-5. Text formatting toolbar unavailable when initially creating a text box —
-   `TextBoxOverlay.js`: Root cause: clicking the font dropdown while the fresh empty
-   textarea was focused triggered `onBlur` → 120ms → `commitEdit()` → empty text →
-   `onDelete()`. The textbox deleted itself before the font change could apply. Fix:
-   `handleBlur` now returns early when `isNewlyPlacedRef.current && !editText.trim()`,
-   keeping the box alive until the user types or explicitly cancels.
-
-6. Font dropdown shows all options in same typeface — `AnnotationToolbar.js`: Native
-   `<select>/<option>` ignores `fontFamily` CSS in most browsers. Replaced with a custom
-   `FontFamilyDropdown` component that renders each option button in its own typeface.
-   Options use `onMouseDown` with `e.preventDefault()` so clicking them does NOT blur
-   the active textarea — font changes apply live while typing.
-
-**What was left unfinished:**
-- Signature round-trip: signatures save as flat images, so they will not reload as
-  editable overlays on re-open. Acceptable for Phase 1.3.
+**Known limitation:**
+- Annotation coordinates for rotated pages: annotations placed BEFORE rotation may visually shift. Annotations placed AFTER rotation work correctly.
 
 ---
 
@@ -319,11 +329,9 @@ Phase 1.4 — Form Filling:
 - Allow users to fill in those fields interactively
 - Save the filled form to PDF (flattened or with live form data)
 
-Or Phase 1.5 — Page Management:
-- Reorder pages (drag and drop in sidebar)
-- Delete pages
-- Rotate pages
-- Insert blank pages or pages from another PDF
+Phase 1.6 — Password-protect / Unlock PDFs:
+- Allow adding a password to a PDF before saving
+- Allow removing a password from an already-unlocked PDF
 
 ---
 
@@ -331,6 +339,8 @@ Or Phase 1.5 — Page Management:
 
 | Date | What Was Accomplished |
 |---|---|
+| March 24, 2026 | Phase 1.5 bug fixes: rotation round-trip, compact organize thumbnails, auto-scroll during drag, multi-page group drag |
+| March 24, 2026 | Phase 1.5 — Page Management: delete, rotate, reorder, extract, merge; MergeModal, ConfirmDialog; backend extract-pages + merge-pdf endpoints |
 | March 23, 2026 | Phase 1.3 polish: draw gaps, date stamp, font previews, signature size, textbox toolbar fix, font dropdown with previews |
 | March 23, 2026 | Annotation round-trip reading, Redo button, pen/sticky/sidebar bug fixes, Phase 1.3 Signature Tool complete |
 | March 20, 2026 | Bug fix + polish: PDFViewer crash fix, highlight opacity fix in saved PDF, click-to-edit sticky notes, native PDF sticky note saving |

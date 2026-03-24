@@ -1,14 +1,17 @@
 # backend/app.py
 # KindPDF — Flask Backend
 # Phase 1.2: Annotation saving added
-# Annotation round-trip: reading added
+# Phase 1.3: Annotation round-trip reading added
+# Phase 1.5: Page management added (reorder, delete, rotate, extract, merge)
 #
 # Routes:
-#   GET  /api/hello                — health check (Phase 0)
-#   POST /api/upload               — receive a PDF, return it for viewing
-#   GET  /api/pdf/<filename>       — serve a stored PDF file
-#   POST /api/save-annotations     — embed annotations into PDF, return for download
-#   GET  /api/annotations/<filename> — read existing native PDF annotations for round-trip loading
+#   GET  /api/hello                    — health check (Phase 0)
+#   POST /api/upload                   — receive a PDF, return it for viewing
+#   GET  /api/pdf/<filename>           — serve a stored PDF file
+#   POST /api/save-annotations         — embed annotations + apply page ops, return for download
+#   GET  /api/annotations/<filename>   — read existing native PDF annotations for round-trip loading
+#   POST /api/extract-pages            — extract selected pages into a new PDF
+#   POST /api/merge-pdf                — merge a second PDF into the current one at a given position
 
 import os
 import uuid
@@ -358,9 +361,9 @@ def get_annotations(filename):
 @app.route('/api/save-annotations', methods=['POST'])
 def save_annotations():
     """
-    Receive annotation data from the frontend, draw the annotations
-    permanently into the PDF using PyMuPDF, and return the result
-    as a downloadable file.
+    Receive annotation data and optional page operations from the frontend,
+    apply page reordering/deletion/rotation using PyMuPDF, draw the annotations
+    permanently, and return the result as a downloadable file.
 
     Expected JSON body:
     {
@@ -375,8 +378,15 @@ def save_annotations():
           { "type": "strikethrough", "rects": [...], "color": "#..." }
         ],
         "2": [ ... ]
-      }
+      },
+      "pageOrder": [1, 3, 2, 4],        // optional — 1-based original page nums in new display order
+      "pageRotations": { "2": 90 }       // optional — additional rotation per original page (0/90/180/270)
     }
+
+    Page operations are applied BEFORE annotations are written:
+      1. doc.select() reorders and/or deletes pages (any page absent from pageOrder is removed)
+      2. set_rotation() applies per-page rotation
+      3. Annotation page numbers are remapped from original → new positions
 
     Coordinates are in normalized PDF points (at scale=1.0, 1 pixel = 1 PDF point).
     """
@@ -393,6 +403,13 @@ def save_annotations():
 
     filename = data.get('filename')
     annotations = data.get('annotations', {})
+    # page_order: list of 1-based original page numbers in new display order.
+    # Any page absent from this list is deleted from the output PDF.
+    # Empty/missing means keep original order.
+    page_order    = data.get('pageOrder', [])
+    # page_rotations: { "origPageNum": additionalDegrees }.
+    # Uses original 1-based page numbers as string keys.
+    page_rotations = data.get('pageRotations', {})
 
     if not filename:
         return jsonify({'error': 'No filename provided.'}), 400
@@ -407,12 +424,40 @@ def save_annotations():
     try:
         doc = fitz.open(filepath)
 
+        # ── Step 1: Apply page reorder / deletion ──────────────────────────────
+        # Build a map from original 1-based page number → new 0-based index in the
+        # output PDF. This is used later to remap annotation page numbers.
+        if page_order and len(page_order) > 0:
+            # Convert 1-based page numbers to 0-based indices for PyMuPDF
+            page_indices = [int(p) - 1 for p in page_order]
+            # Build the remapping BEFORE calling select() (indices change after)
+            orig_to_new_idx = {int(orig_p): new_idx for new_idx, orig_p in enumerate(page_order)}
+            doc.select(page_indices)
+        else:
+            # No reordering requested — keep original order, build identity map
+            orig_to_new_idx = {i + 1: i for i in range(doc.page_count)}
+
+        # ── Step 2: Apply per-page rotations ───────────────────────────────────
+        # Rotation is applied AFTER select() so indices are already remapped.
+        for orig_str, rotation in page_rotations.items():
+            orig_pagenum = int(orig_str)
+            new_idx = orig_to_new_idx.get(orig_pagenum)
+            if new_idx is not None and 0 <= new_idx < doc.page_count:
+                # set_rotation() sets the page's absolute rotation in the PDF dictionary.
+                # We add the new rotation on top of any existing page rotation.
+                existing_rot = doc[new_idx].rotation
+                doc[new_idx].set_rotation((existing_rot + int(rotation)) % 360)
+
+        # ── Step 3: Write annotations (remapped to new page positions) ─────────
         for page_str, page_annotations in annotations.items():
-            page_num = int(page_str) - 1  # Convert 1-based to 0-based index
-            if page_num < 0 or page_num >= doc.page_count:
+            orig_pagenum = int(page_str)
+            # Look up the new 0-based index for this original page number.
+            # If the page was deleted (not in orig_to_new_idx), skip it.
+            new_idx = orig_to_new_idx.get(orig_pagenum)
+            if new_idx is None or new_idx < 0 or new_idx >= doc.page_count:
                 continue
 
-            page = doc[page_num]
+            page = doc[new_idx]
 
             # ── All annotation types are now written as native PDF annotation objects.
             # This replaces the previous flat-graphics approach (draw_rect / draw_line /
@@ -572,6 +617,154 @@ def save_annotations():
     except Exception as e:
         print(f'Error saving annotations: {e}')
         return jsonify({'error': f'Something went wrong while saving: {str(e)}'}), 500
+
+
+@app.route('/api/extract-pages', methods=['POST'])
+def extract_pages():
+    """
+    Extract a subset of pages from a PDF and return them as a new downloadable PDF.
+
+    Expected JSON body:
+    {
+      "filename": "uuid_original.pdf",
+      "pageNums": [1, 3, 5]           // 1-based original page numbers to keep
+    }
+
+    Uses PyMuPDF doc.select() to keep only the requested pages, then returns the
+    result as a download. The original file is not modified.
+    """
+    try:
+        import fitz
+    except ImportError:
+        return jsonify({'error': 'PyMuPDF is required for page extraction.'}), 500
+
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data received.'}), 400
+
+    filename  = data.get('filename')
+    page_nums = data.get('pageNums', [])
+
+    if not filename:
+        return jsonify({'error': 'No filename provided.'}), 400
+    if not page_nums:
+        return jsonify({'error': 'Please select at least one page to extract.'}), 400
+
+    safe_filename = secure_filename(filename)
+    filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
+
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'The original file was not found. Please re-open it and try again.'}), 404
+
+    try:
+        doc = fitz.open(filepath)
+
+        # Convert 1-based page numbers to 0-based indices, filtering out-of-range values
+        valid_indices = [int(p) - 1 for p in page_nums if 1 <= int(p) <= doc.page_count]
+        if not valid_indices:
+            return jsonify({'error': 'None of the selected pages exist in this document.'}), 400
+
+        doc.select(valid_indices)
+
+        output_filename = f'extracted_{uuid.uuid4().hex}_{safe_filename}'
+        output_path = os.path.join(UPLOAD_FOLDER, output_filename)
+        doc.save(output_path, garbage=4, deflate=True)
+        doc.close()
+
+        return send_from_directory(
+            UPLOAD_FOLDER,
+            output_filename,
+            as_attachment=True,
+            download_name='extracted_pages.pdf'
+        )
+
+    except Exception as e:
+        print(f'Error extracting pages: {e}')
+        return jsonify({'error': f'Something went wrong while extracting pages: {str(e)}'}), 500
+
+
+@app.route('/api/merge-pdf', methods=['POST'])
+def merge_pdf():
+    """
+    Merge a second PDF into the current working PDF at a specified position,
+    save the result as a new temporary file, and return the new filename.
+
+    The frontend reloads the viewer with the new filename after a successful merge.
+    The original file is not modified.
+
+    Expected JSON body:
+    {
+      "baseFilename":   "uuid_base.pdf",      // the current working PDF
+      "mergeFilename":  "uuid_second.pdf",    // previously uploaded second PDF
+      "insertAfterPage": 2                    // 1-based page after which to insert (0 = prepend, -1 = append)
+    }
+
+    Returns:
+    {
+      "success": true,
+      "filename": "merged_uuid_base.pdf",   // new working filename
+      "numPages": 12                         // new total page count
+    }
+
+    PyMuPDF insert_pdf() semantics:
+      start_at = 0          → insert before page 0 (at the very beginning)
+      start_at = N          → insert before page N (0-based) = after 1-based page N
+      start_at = -1         → append at the end
+    """
+    try:
+        import fitz
+    except ImportError:
+        return jsonify({'error': 'PyMuPDF is required for PDF merging.'}), 500
+
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data received.'}), 400
+
+    base_filename  = data.get('baseFilename')
+    merge_filename = data.get('mergeFilename')
+    insert_after   = data.get('insertAfterPage', -1)  # default: append at end
+
+    if not base_filename or not merge_filename:
+        return jsonify({'error': 'Both a base file and a file to merge are required.'}), 400
+
+    base_safe  = secure_filename(base_filename)
+    merge_safe = secure_filename(merge_filename)
+    base_path  = os.path.join(UPLOAD_FOLDER, base_safe)
+    merge_path = os.path.join(UPLOAD_FOLDER, merge_safe)
+
+    if not os.path.exists(base_path):
+        return jsonify({'error': 'The base file was not found. Please re-open it and try again.'}), 404
+    if not os.path.exists(merge_path):
+        return jsonify({'error': 'The file to merge was not found. Please upload it again.'}), 404
+
+    try:
+        base_doc  = fitz.open(base_path)
+        merge_doc = fitz.open(merge_path)
+
+        # Determine insertion position:
+        #   insert_after = 0  → prepend (start_at=0)
+        #   insert_after = N  → after 1-based page N (start_at=N, which is before 0-based page N)
+        #   insert_after = -1 → append (start_at=-1)
+        start_at = int(insert_after)  # -1 or 0 stays as-is; positive N maps directly
+
+        base_doc.insert_pdf(merge_doc, start_at=start_at)
+        merge_doc.close()
+
+        output_filename = f'merged_{uuid.uuid4().hex}_{base_safe}'
+        output_path = os.path.join(UPLOAD_FOLDER, output_filename)
+        base_doc.save(output_path, garbage=4, deflate=True)
+        num_pages = base_doc.page_count
+        base_doc.close()
+
+        return jsonify({
+            'success':  True,
+            'filename': output_filename,
+            'numPages': num_pages
+        })
+
+    except Exception as e:
+        print(f'Error merging PDFs: {e}')
+        return jsonify({'error': f'Something went wrong while merging the files: {str(e)}'}), 500
 
 
 if __name__ == '__main__':

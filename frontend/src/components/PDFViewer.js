@@ -18,6 +18,7 @@ import StickyNoteOverlay from './StickyNoteOverlay';
 import TextBoxOverlay from './TextBoxOverlay';
 import SignatureModal from './SignatureModal';
 import SignatureOverlay from './SignatureOverlay';
+import MergeModal from './MergeModal';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.mjs',
@@ -268,6 +269,16 @@ function annotationHitTest(ann, normX, normY, normRadius) {
 
 export default function PDFViewer({ pdfUrl, pdfName, pdfFilename, onClose }) {
 
+  // ── Internal copies of props so that merge can reload the PDF without
+  //    requiring the parent (App.js) to change. After a merge the viewer
+  //    updates activePdfUrl/activePdfFilename to point at the merged file.
+  const [activePdfUrl,      setActivePdfUrl]      = useState(pdfUrl);
+  const [activePdfFilename, setActivePdfFilename] = useState(pdfFilename);
+
+  // Sync internal URL/filename if parent prop changes (e.g. user opens new file)
+  useEffect(() => { setActivePdfUrl(pdfUrl);           }, [pdfUrl]);
+  useEffect(() => { setActivePdfFilename(pdfFilename); }, [pdfFilename]);
+
   // --- Core viewer state ---
   const [pdfDoc, setPdfDoc] = useState(null);
   const [numPages, setNumPages] = useState(0);
@@ -276,6 +287,34 @@ export default function PDFViewer({ pdfUrl, pdfName, pdfFilename, onClose }) {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+
+  // ── Phase 1.5: Page management state ─────────────────────────────────────
+  //
+  // pageHistory uses the same past/present/future undo pattern as annotationHistory.
+  //   present.pageOrder    — array of original 1-based page numbers in display order.
+  //                          Deletions are reflected as missing entries.
+  //   present.pageRotations — { origPageNum: additionalDegrees } — additional rotation
+  //                           (0 / 90 / 180 / 270) applied at save time via PyMuPDF.
+  //                           Thumbnails + main render also apply this visually.
+  const EMPTY_PAGE_STATE = { pageOrder: [], pageRotations: {} };
+  const [pageHistory, setPageHistory] = useState({
+    past: [], present: EMPTY_PAGE_STATE, future: []
+  });
+
+  // Convenience aliases
+  const pageOrder     = pageHistory.present.pageOrder;
+  const pageRotations = pageHistory.present.pageRotations;
+  const canPageUndo   = pageHistory.past.length > 0;
+  const canPageRedo   = pageHistory.future.length > 0;
+
+  // Whether the sidebar is in page management mode
+  const [pageManagementMode, setPageManagementMode] = useState(false);
+
+  // Set of original page numbers checked for extraction
+  const [selectedPages, setSelectedPages] = useState(new Set());
+
+  // Whether the Merge PDF modal is open
+  const [mergeModalOpen, setMergeModalOpen] = useState(false);
 
   // --- Search state ---
   const [searchQuery, setSearchQuery] = useState('');
@@ -369,14 +408,19 @@ const [openStickyId, setOpenStickyId] = useState(null);
   // ============================================================
 
   useEffect(() => {
-    if (!pdfUrl) return;
+    if (!activePdfUrl) return;
     setIsLoading(true);
     setError(null);
     textContentCacheRef.current = {};
     pageViewportsRef.current = {};
 
+    // Reset page management state whenever a new PDF loads
+    setPageHistory({ past: [], present: EMPTY_PAGE_STATE, future: [] });
+    setSelectedPages(new Set());
+    setPageManagementMode(false);
+
     let cancelled = false;
-    const loadingTask = pdfjsLib.getDocument(pdfUrl);
+    const loadingTask = pdfjsLib.getDocument(activePdfUrl);
 
     loadingTask.promise
       .then(async doc => {
@@ -385,16 +429,24 @@ const [openStickyId, setOpenStickyId] = useState(null);
         setNumPages(doc.numPages);
         setIsLoading(false);
 
+        // ── Initialize pageOrder to [1, 2, 3, … N] in original document order ──
+        const initialOrder = Array.from({ length: doc.numPages }, (_, i) => i + 1);
+        setPageHistory({
+          past:    [],
+          present: { pageOrder: initialOrder, pageRotations: {} },
+          future:  [],
+        });
+
         // ── Annotation round-trip: load existing native PDF annotations ──
         // After the PDF is ready, ask the backend to read any native annotation
         // objects that were previously saved (e.g. sticky notes saved by KindPDF,
         // or annotations added in Acrobat / Preview). If any come back, seed the
         // annotation history so they appear as fully editable annotations immediately.
         // A fetch failure is silently ignored — the PDF simply opens clean.
-        if (pdfFilename) {
+        if (activePdfFilename) {
           try {
             const res = await fetch(
-              `http://localhost:5000/api/annotations/${encodeURIComponent(pdfFilename)}`
+              `http://localhost:5000/api/annotations/${encodeURIComponent(activePdfFilename)}`
             );
             if (cancelled) return;
             if (res.ok) {
@@ -426,7 +478,7 @@ const [openStickyId, setOpenStickyId] = useState(null);
       });
 
     return () => { cancelled = true; loadingTask.destroy(); };
-  }, [pdfUrl]);
+  }, [activePdfUrl]); // eslint-disable-line react-hooks/exhaustive-deps
 
 
   // ============================================================
@@ -446,7 +498,7 @@ const [openStickyId, setOpenStickyId] = useState(null);
   // PAGE RENDERING
   // ============================================================
 
-  const renderPage = useCallback(async (pageNum, doc, currentScale) => {
+  const renderPage = useCallback(async (pageNum, doc, currentScale, rotation = 0) => {
     if (renderTasksRef.current[pageNum]) {
       try { renderTasksRef.current[pageNum].cancel(); } catch (e) {}
       renderTasksRef.current[pageNum] = null;
@@ -454,7 +506,13 @@ const [openStickyId, setOpenStickyId] = useState(null);
 
     try {
       const page = await doc.getPage(pageNum);
-      const viewport = page.getViewport({ scale: currentScale });
+      // PDF.js getViewport({ rotation }) has default = page.rotate (intrinsic rotation).
+      // BUT if you pass rotation: 0 explicitly, it overrides the intrinsic rotation to 0.
+      // So we always compute totalRotation = page's own rotation + our additional rotation.
+      // This ensures saved rotations (baked into the PDF by PyMuPDF) survive on re-open.
+      const intrinsicRotation = page.rotate || 0;
+      const totalRotation     = (intrinsicRotation + rotation) % 360;
+      const viewport = page.getViewport({ scale: currentScale, rotation: totalRotation });
 
       // Store viewport for synchronous use in selection tool mouse handlers
       pageViewportsRef.current[pageNum] = viewport;
@@ -501,9 +559,13 @@ const [openStickyId, setOpenStickyId] = useState(null);
   }, []);
 
   useEffect(() => {
-    if (!pdfDoc) return;
-    for (let i = 1; i <= pdfDoc.numPages; i++) renderPage(i, pdfDoc, scale);
-  }, [pdfDoc, scale, renderPage]);
+    if (!pdfDoc || pageOrder.length === 0) return;
+    // Render pages in pageOrder order, passing the per-page rotation so PDF.js
+    // applies it to the viewport (correct dimensions + coordinate system).
+    pageOrder.forEach(origPageNum => {
+      renderPage(origPageNum, pdfDoc, scale, pageRotations[origPageNum] || 0);
+    });
+  }, [pdfDoc, scale, renderPage, pageOrder, pageRotations]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Redraw annotation canvases when annotations change (without re-rendering PDF)
   useEffect(() => {
@@ -761,6 +823,186 @@ const [openStickyId, setOpenStickyId] = useState(null);
 
   const canUndo = annotationHistory.past.length > 0;
   const canRedo = (annotationHistory.future || []).length > 0;
+
+
+  // ============================================================
+  // PAGE MANAGEMENT — handlers (Phase 1.5)
+  // ============================================================
+
+  // Internal helper: push a new present state to pageHistory (creates undo entry)
+  const pushPageState = useCallback((newPresent) => {
+    setPageHistory(prev => ({
+      past:    [...prev.past, prev.present],
+      present: newPresent,
+      future:  [],
+    }));
+  }, []);
+
+  // Undo the last page operation
+  const handlePageUndo = useCallback(() => {
+    setPageHistory(prev => {
+      if (prev.past.length === 0) return prev;
+      return {
+        past:    prev.past.slice(0, -1),
+        present: prev.past[prev.past.length - 1],
+        future:  [prev.present, ...prev.future],
+      };
+    });
+  }, []);
+
+  // Redo the last undone page operation
+  const handlePageRedo = useCallback(() => {
+    setPageHistory(prev => {
+      if (prev.future.length === 0) return prev;
+      return {
+        past:    [...prev.past, prev.present],
+        present: prev.future[0],
+        future:  prev.future.slice(1),
+      };
+    });
+  }, []);
+
+  // Delete a page: remove it from pageOrder (annotations for that page remain
+  // in annotationHistory but will be excluded at save time since the page won't
+  // appear in the pageOrder array sent to the backend).
+  const handleDeletePage = useCallback((origPageNum) => {
+    setPageHistory(prev => {
+      const newOrder = prev.present.pageOrder.filter(p => p !== origPageNum);
+      if (newOrder.length === prev.present.pageOrder.length) return prev; // not found
+      return {
+        past:    [...prev.past, prev.present],
+        present: { ...prev.present, pageOrder: newOrder },
+        future:  [],
+      };
+    });
+    // Clear selection for this page if it was selected
+    setSelectedPages(prev => {
+      const next = new Set(prev);
+      next.delete(origPageNum);
+      return next;
+    });
+  }, []);
+
+  // Rotate a page: add 90° (right) or -90° (left) to its current additional rotation.
+  // Rotation wraps in [0, 90, 180, 270]. Applied visually via the render effect and
+  // permanently saved via PyMuPDF page.set_rotation() in the backend save endpoint.
+  const handleRotatePage = useCallback((origPageNum, direction) => {
+    setPageHistory(prev => {
+      const currentRot = prev.present.pageRotations[origPageNum] || 0;
+      const delta      = direction === 'right' ? 90 : -90;
+      const newRot     = ((currentRot + delta) % 360 + 360) % 360;
+      return {
+        past:    [...prev.past, prev.present],
+        present: {
+          ...prev.present,
+          pageRotations: { ...prev.present.pageRotations, [origPageNum]: newRot },
+        },
+        future: [],
+      };
+    });
+  }, []);
+
+  // Reorder pages via drag-and-drop.
+  // If the dragged page is in selectedPages AND multiple pages are selected, moves
+  // the entire selection as a group (preserving their relative order) to the drop target.
+  // Otherwise moves just the single dragged page.
+  const handleReorderPages = useCallback((draggedOrigPageNum, targetOrigPageNum, currentSelectedPages) => {
+    setPageHistory(prev => {
+      const order = [...prev.present.pageOrder];
+
+      // Determine which pages to move
+      const isGroupMove =
+        currentSelectedPages &&
+        currentSelectedPages.has(draggedOrigPageNum) &&
+        currentSelectedPages.size > 1;
+
+      const pagesToMove = isGroupMove
+        ? order.filter(p => currentSelectedPages.has(p))  // selected pages in current order
+        : [draggedOrigPageNum];
+
+      // Remove the pages-to-move from the array
+      const withoutMoving = order.filter(p => !pagesToMove.includes(p));
+
+      // Find where the target sits in the reduced array
+      const targetIdx = withoutMoving.indexOf(targetOrigPageNum);
+
+      let newOrder;
+      if (targetIdx === -1) {
+        // Target was itself in the moving set — append at end
+        newOrder = [...withoutMoving, ...pagesToMove];
+      } else {
+        // Insert the group before the target (natural "drop onto target" feel)
+        newOrder = [...withoutMoving];
+        newOrder.splice(targetIdx, 0, ...pagesToMove);
+      }
+
+      if (JSON.stringify(newOrder) === JSON.stringify(order)) return prev; // no change
+
+      return {
+        past:    [...prev.past, prev.present],
+        present: { ...prev.present, pageOrder: newOrder },
+        future:  [],
+      };
+    });
+  }, []);
+
+  // Toggle selection for a page (used in management mode for extract)
+  const handleSelectPage = useCallback((origPageNum) => {
+    setSelectedPages(prev => {
+      const next = new Set(prev);
+      if (next.has(origPageNum)) next.delete(origPageNum);
+      else next.add(origPageNum);
+      return next;
+    });
+  }, []);
+
+  // Extract selected pages: call backend, download the resulting PDF.
+  const handleExtractPages = useCallback(async () => {
+    if (selectedPages.size === 0 || !activePdfFilename) return;
+
+    try {
+      const res = await fetch('http://localhost:5000/api/extract-pages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: activePdfFilename,
+          pageNums: Array.from(selectedPages),
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(`Could not extract pages: ${err.error || 'Unknown error.'}`);
+        return;
+      }
+
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href     = url;
+      a.download = 'extracted_pages.pdf';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      // Clear selection after successful extract
+      setSelectedPages(new Set());
+    } catch (err) {
+      alert(`Could not extract pages: ${err.message}`);
+    }
+  }, [selectedPages, activePdfFilename]);
+
+  // Called after a successful PDF merge: reload the viewer with the new merged file.
+  const handleMergeComplete = useCallback((newFilename, newNumPages) => {
+    const newUrl = `http://localhost:5000/api/pdf/${encodeURIComponent(newFilename)}`;
+    // Updating activePdfUrl triggers the pdfDoc load useEffect, which resets
+    // pageOrder, pageRotations, annotations, and all viewer state cleanly.
+    setActivePdfUrl(newUrl);
+    setActivePdfFilename(newFilename);
+    // Reset annotation history since we have a new document
+    setAnnotationHistory({ past: [], present: {}, future: [] });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
 
   // ============================================================
@@ -1334,17 +1576,24 @@ else if (activeTool === 'sticky') {
   // ============================================================
 
   const handleSavePdf = useCallback(async () => {
-    if (!pdfFilename) {
+    if (!activePdfFilename) {
       alert('Cannot save: the original filename is not available. Please re-open the file and try again.');
       return;
     }
 
     setIsSaving(true);
     try {
+      // Include pageOrder and pageRotations so the backend can apply page operations
+      // (reorder, delete, rotate) before embedding annotations.
       const response = await fetch('http://localhost:5000/api/save-annotations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: pdfFilename, annotations }),
+        body: JSON.stringify({
+          filename:      activePdfFilename,
+          annotations,
+          pageOrder:     pageOrder.length > 0 ? pageOrder : undefined,
+          pageRotations: Object.keys(pageRotations).length > 0 ? pageRotations : undefined,
+        }),
       });
 
       if (!response.ok) {
@@ -1389,7 +1638,7 @@ else if (activeTool === 'sticky') {
     } finally {
       setIsSaving(false);
     }
-  }, [pdfFilename, pdfName, annotations]);
+  }, [activePdfFilename, pdfName, annotations, pageOrder, pageRotations]); // eslint-disable-line react-hooks/exhaustive-deps
 
 
   // ============================================================
@@ -1444,8 +1693,17 @@ else if (activeTool === 'sticky') {
     <div className="flex flex-col h-screen bg-gray-100">
 
       <Toolbar
-        currentPage={currentPage} numPages={numPages} scale={scale}
-        onPageChange={scrollToPage} onZoomIn={zoomIn} onZoomOut={zoomOut} onFitToScreen={fitToScreen}
+        // Show display position (1-based index in pageOrder) rather than raw original page number,
+        // so the toolbar reads "Page 2 of 5" after deleting page 1 — not "Page 2 of 6".
+        currentPage={pageOrder.length > 0 ? (pageOrder.indexOf(currentPage) + 1 || 1) : currentPage}
+        numPages={pageOrder.length > 0 ? pageOrder.length : numPages}
+        // onPageChange receives a display position; convert it back to original page num for scrollToPage
+        onPageChange={displayPos => {
+          const origPageNum = pageOrder.length > 0 ? pageOrder[displayPos - 1] : displayPos;
+          if (origPageNum) scrollToPage(origPageNum);
+        }}
+        scale={scale}
+        onZoomIn={zoomIn} onZoomOut={zoomOut} onFitToScreen={fitToScreen}
         onToggleSidebar={() => setSidebarOpen(o => !o)} onClose={onClose} pdfName={pdfName}
         searchQuery={searchQuery} onSearchChange={setSearchQuery}
         onSearchSubmit={() => allMatches.length > 0 ? handleSearchNext() : runSearch(searchQuery)}
@@ -1468,6 +1726,29 @@ else if (activeTool === 'sticky') {
         isUnderline={isUnderline} onUnderlineChange={handleUnderlineChange}
         hasSelectedTextBox={!!selectedTextBox}
       />
+
+      {/* ── Page management mode banner ─────────────────────────────────────
+          Shown while pageManagementMode is true. Tells the user what they can do
+          and where to find the controls (in the left sidebar).
+      ── */}
+      {pageManagementMode && (
+        <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2">
+            <span className="text-lg">📄</span>
+            <span className="text-sm font-medium text-amber-800">
+              Page management mode — use the sidebar to reorder, rotate, remove, or extract pages.
+              Changes are saved when you click <strong>Save As PDF</strong>.
+            </span>
+          </div>
+          <button
+            onClick={() => setPageManagementMode(false)}
+            title="Exit page management mode"
+            className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-amber-200 hover:bg-amber-300 text-amber-900 text-sm font-medium transition-colors flex-shrink-0"
+          >
+            ✓ Done
+          </button>
+        </div>
+      )}
 
       {/* ── Signature placement banner ──────────────────────────────────────
           Shown while activeTool === 'signature_place'. Prompts the user to
@@ -1494,12 +1775,34 @@ else if (activeTool === 'sticky') {
       <div className="flex flex-1 overflow-hidden">
 
         {sidebarOpen && (
-          <Sidebar pdfDoc={pdfDoc} numPages={numPages} currentPage={currentPage} onGoToPage={scrollToPage} />
+          <Sidebar
+            pdfDoc={pdfDoc}
+            currentPage={currentPage}
+            onGoToPage={scrollToPage}
+            pageOrder={pageOrder}
+            pageRotations={pageRotations}
+            pageManagementMode={pageManagementMode}
+            onToggleManageMode={() => setPageManagementMode(m => !m)}
+            onDeletePage={handleDeletePage}
+            onRotatePage={handleRotatePage}
+            onReorderPages={handleReorderPages}
+            onSelectPage={handleSelectPage}
+            selectedPages={selectedPages}
+            onExtractPages={handleExtractPages}
+            onMergePdf={() => setMergeModalOpen(true)}
+            canPageUndo={canPageUndo}
+            canPageRedo={canPageRedo}
+            onPageUndo={handlePageUndo}
+            onPageRedo={handlePageRedo}
+          />
         )}
 
         <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-auto bg-gray-200">
           <div className="flex flex-col items-center py-6 gap-6">
-            {Array.from({ length: numPages }, (_, i) => i + 1).map(pageNum => (
+            {/* Render pages in pageOrder order. Each pageNum here is the original
+                1-based page number from the PDF — unchanged by reordering/deletion,
+                so all canvas IDs, annotation lookups, and refs remain stable. */}
+            {(pageOrder.length > 0 ? pageOrder : Array.from({ length: numPages }, (_, i) => i + 1)).map(pageNum => (
               <div
                 key={pageNum}
                 ref={el => { pageRefs.current[pageNum] = el; }}
@@ -1660,6 +1963,17 @@ else if (activeTool === 'sticky') {
           onCancel={() => {
             setSignatureModalOpen(false);
           }}
+        />
+      )}
+
+      {/* ── Merge PDF modal (Phase 1.5) ──────────────────────────────── */}
+      {mergeModalOpen && (
+        <MergeModal
+          isOpen={mergeModalOpen}
+          currentNumPages={pageOrder.length || numPages}
+          currentFilename={activePdfFilename}
+          onClose={() => setMergeModalOpen(false)}
+          onMergeComplete={handleMergeComplete}
         />
       )}
 
