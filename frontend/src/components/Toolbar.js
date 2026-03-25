@@ -15,9 +15,11 @@ function Toolbar({
   onZoomIn,          // Callback: increase zoom
   onZoomOut,         // Callback: decrease zoom
   onFitToScreen,     // Callback: fit page to window width
+  onZoomTo,          // Callback: jump to a specific zoom level (0.1–4.0)
   onClose,           // Callback: close document, go back to home
   onToggleSidebar,   // Callback: show/hide thumbnail sidebar
   pdfName,           // Filename to display in the toolbar
+  onProtectUnlock,   // Callback: open the Password Settings modal (Phase 1.6)
   // Search props
   searchQuery,         // Current search text
   onSearchChange,      // Callback: user typed in search box
@@ -31,6 +33,10 @@ function Toolbar({
   // Local state for the page number input field
   const [pageInputValue, setPageInputValue] = useState(currentPage);
 
+  // Local state for the zoom percentage input field.
+  // Stored as a string so the user can type freely; validated on commit.
+  const [zoomInputValue, setZoomInputValue] = useState(String(Math.round(scale * 100)));
+
   // When the user types a page number and presses Enter
   const handlePageInputKeyDown = (e) => {
     if (e.key === 'Enter') {
@@ -43,10 +49,29 @@ function Toolbar({
     }
   };
 
-  // Keep input in sync when parent changes the page (e.g. scrolling)
+  // Keep page input in sync when parent changes the page (e.g. scrolling)
   React.useEffect(() => {
     setPageInputValue(currentPage);
   }, [currentPage]);
+
+  // Keep zoom input in sync when scale changes externally
+  // (e.g. Smaller / Larger buttons, or Fit to Screen)
+  React.useEffect(() => {
+    setZoomInputValue(String(Math.round(scale * 100)));
+  }, [scale]);
+
+  // Commit a zoom value typed by the user.
+  // Accepts plain numbers ("75") or numbers with % ("75%").
+  // Valid range: 10 % – 400 %. Reverts to current scale on invalid input.
+  const commitZoom = () => {
+    const num = parseInt(zoomInputValue.replace('%', '').trim(), 10);
+    if (!isNaN(num) && num >= 10 && num <= 400) {
+      onZoomTo(num / 100);
+    } else {
+      // Revert display to the actual current scale
+      setZoomInputValue(String(Math.round(scale * 100)));
+    }
+  };
 
   return (
     <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-2 flex-wrap shadow-sm">
@@ -209,9 +234,33 @@ function Toolbar({
           <span className="hidden sm:inline">Smaller</span>
         </button>
 
-        <span className="px-2 text-gray-600 text-sm font-medium w-14 text-center" aria-label={`Zoom level: ${Math.round(scale * 100)} percent`}>
-          {Math.round(scale * 100)}%
-        </span>
+        {/* Editable zoom percentage — click to highlight and type a custom value */}
+        <div className="flex items-center">
+          <label htmlFor="zoom-input" className="sr-only">Zoom percentage</label>
+          <input
+            id="zoom-input"
+            type="number"
+            min={10}
+            max={400}
+            value={zoomInputValue}
+            onChange={e => setZoomInputValue(e.target.value)}
+            onFocus={e => e.target.select()}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { commitZoom(); e.target.blur(); }
+              if (e.key === 'Escape') {
+                setZoomInputValue(String(Math.round(scale * 100)));
+                e.target.blur();
+              }
+            }}
+            onBlur={commitZoom}
+            title="Type a zoom percentage (10–400) and press Enter"
+            aria-label={`Zoom level: ${Math.round(scale * 100)} percent. Click to change.`}
+            className="w-12 text-center border border-gray-300 rounded-lg py-1.5 text-sm font-medium
+                       text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent
+                       [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+          />
+          <span className="pl-0.5 text-sm text-gray-500 font-medium select-none" aria-hidden="true">%</span>
+        </div>
 
         <button
           onClick={onZoomIn}
@@ -237,6 +286,24 @@ function Toolbar({
           <span className="hidden sm:inline">Fit to Screen</span>
         </button>
       </div>
+
+      {/* Divider */}
+      <div className="w-px h-8 bg-gray-200 mx-1 hidden sm:block" aria-hidden="true" />
+
+      {/* ── Password Settings (Phase 1.6) ── */}
+      <button
+        onClick={onProtectUnlock}
+        title="Add a password to this file, or remove an existing password"
+        aria-label="Password settings — protect or unlock this PDF"
+        className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-gray-700 hover:bg-gray-100 transition-colors text-sm font-medium"
+      >
+        {/* Lock icon */}
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+            d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+        </svg>
+        <span className="hidden sm:inline">Lock PDF</span>
+      </button>
 
     </div>
   );

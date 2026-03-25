@@ -19,6 +19,9 @@ import TextBoxOverlay from './TextBoxOverlay';
 import SignatureModal from './SignatureModal';
 import SignatureOverlay from './SignatureOverlay';
 import MergeModal from './MergeModal';
+import PasswordModal from './PasswordModal';
+import FormOverlay    from './FormOverlay';
+import ButtonOverlay  from './ButtonOverlay';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.mjs',
@@ -28,6 +31,75 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
 // ============================================================
 // UTILITY FUNCTIONS (pure, defined outside component)
 // ============================================================
+
+// ── Form calculation helpers (Phase 1.4 patch) ──────────────────────────────
+//
+// Parses the Acrobat JS calculation scripts that PDF widgets carry.
+// Two formats appear in the wild — both are handled:
+//
+//  1. Standard AFSimple_Calculate (simple PDFs):
+//       AFSimple_Calculate("PRD", new Array("qty", "unit_price"))
+//
+//  2. Custom event.value / getField pattern (most real-world order forms):
+//       event.value = AFMakeNumber(getField("QuantityRow1").value)
+//                   * AFMakeNumber(getField("UnitPriceRow1").value)
+//     or summing several fields:
+//       event.value = AFMakeNumber(getField("fill_48").value)
+//                   + AFMakeNumber(getField("fill_49").value) + ...
+//
+// The calculation runs client-side in a useEffect so computed fields update
+// live as the user types, with no Acrobat or server-side JS engine needed.
+
+function parseCalcScript(script) {
+  if (!script || typeof script !== 'string') return null;
+
+  // ── Format 1: AFSimple_Calculate ────────────────────────────────────────
+  const simple = script.match(
+    /AFSimple_Calculate\s*\(\s*["'](\w+)["']\s*,\s*new\s+Array\s*\(([^)]*)\)/i
+  );
+  if (simple) {
+    const op = simple[1].toUpperCase();
+    const sourceFields = [...simple[2].matchAll(/["']([^"']+)["']/g)].map(r => r[1]);
+    if (sourceFields.length) return { op, sourceFields };
+  }
+
+  // ── Format 2: event.value = ... getField("name").value ... ──────────────
+  // Extract all referenced field names, preserving order.
+  const fieldRefs = [...script.matchAll(/getField\s*\(\s*["']([^"']+)["']\s*\)/g)]
+    .map(m => m[1]);
+  if (!fieldRefs.length) return null;
+
+  // Infer the operator by looking at what's between the AFMakeNumber() calls.
+  // Replace each AFMakeNumber(...) with a placeholder so we can read the operators.
+  const skeleton = script.replace(/AFMakeNumber\s*\([^)]+\)/g, 'X');
+  const hasMul  = skeleton.includes('*');
+  const hasPlus = skeleton.includes('+');
+
+  const op = (hasMul && !hasPlus) ? 'PRD' : 'SUM';  // default to SUM for + or unknown
+  return { op, sourceFields: fieldRefs };
+}
+
+function runCalcOp(op, nums) {
+  if (!nums.length) return '';
+  switch (op) {
+    case 'SUM': return nums.reduce((a, b) => a + b, 0);
+    case 'PRD': return nums.reduce((a, b) => a * b, 1);
+    case 'AVG': return nums.reduce((a, b) => a + b, 0) / nums.length;
+    case 'MIN': return Math.min(...nums);
+    case 'MAX': return Math.max(...nums);
+    default:    return '';
+  }
+}
+
+// Format a calculation result: strip unnecessary trailing decimals,
+// show up to 2 decimal places (e.g. "5.00" → "5", "5.10" → "5.1", "5.123" → "5.12").
+function formatCalcResult(result) {
+  if (result === '' || result === null || result === undefined) return '';
+  const n = Number(result);
+  if (!Number.isFinite(n)) return '';
+  // Round to 2 dp then trim trailing zeros
+  return parseFloat(n.toFixed(2)).toString();
+}
 
 // Shortest distance from point (px,py) to line segment (ax,ay)-(bx,by).
 // Used by the fine eraser to detect proximity to stroke segments.
@@ -288,6 +360,19 @@ export default function PDFViewer({ pdfUrl, pdfName, pdfFilename, onClose }) {
   const [error, setError] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
+  // ── Phase 1.6: PDF open-password prompt ──────────────────────────────────
+  //
+  // When PDF.js encounters a password-protected PDF it calls loadingTask.onPassword.
+  // We store the updatePassword callback here so the user can type a password and
+  // we can pass it back to PDF.js to retry opening.
+  //
+  // pdfOpenPasswordCallback — the updatePassword fn supplied by PDF.js, or null when no prompt
+  // pdfOpenPasswordError    — true when the last attempt used the wrong password
+  // pdfOpenPasswordValue    — controlled input value for the prompt
+  const [pdfOpenPasswordCallback, setPdfOpenPasswordCallback] = useState(null);
+  const [pdfOpenPasswordError,    setPdfOpenPasswordError]    = useState(false);
+  const [pdfOpenPasswordValue,    setPdfOpenPasswordValue]    = useState('');
+
   // ── Phase 1.5: Page management state ─────────────────────────────────────
   //
   // pageHistory uses the same past/present/future undo pattern as annotationHistory.
@@ -316,10 +401,85 @@ export default function PDFViewer({ pdfUrl, pdfName, pdfFilename, onClose }) {
   // Whether the Merge PDF modal is open
   const [mergeModalOpen, setMergeModalOpen] = useState(false);
 
+  // Whether the Password Settings modal is open (Phase 1.6)
+  const [passwordModalOpen, setPasswordModalOpen] = useState(false);
+
+  // ── Phase 1.4: Form filling ────────────────────────────────────────────────
+  //
+  // formFields    — null = not yet checked; [] = PDF has no fillable fields;
+  //                 [...] = array of field objects from /api/form-fields
+  // formValues    — controlled state: { fieldName: currentValue }
+  //                 seeded from each field's existing PDF value on load,
+  //                 updated live as the user types / checks / selects.
+  //                 Included in the Save As PDF payload so values are written
+  //                 as live (non-flattened) AcroForm fields → editable on re-open.
+  // hasCalculations — true when any field has a script_calc string.
+  //                 When true: a banner is shown and a useEffect re-runs
+  //                 AFSimple_Calculate logic whenever formValues changes.
+  // xfaBanner     — true when the PDF is XFA-only (shows the warning banner)
+  // pageDimensions— { [pageNum]: { width, height } } in PDF points at scale=1.
+  //                 Used by FormOverlay to convert normalised 0–1 rects back
+  //                 to pixel positions at any zoom level.
+  const [formFields,       setFormFields]       = useState(null);
+  const [formValues,       setFormValues]       = useState({});
+  const [hasCalculations,  setHasCalculations]  = useState(false);
+  const [xfaBanner,        setXfaBanner]        = useState(false);
+  const [pageDimensions,   setPageDimensions]   = useState({});
+
+  // pdfButtons — push-button widgets extracted from AcroForm.
+  // Rendered by ButtonOverlay as HTML buttons over the page canvas.
+  // null = not yet fetched; [] = PDF has no buttons; [...] = button list.
+  const [pdfButtons,       setPdfButtons]       = useState(null);
+
+  // buttonModal — controls the honest "what this button would do" dialog.
+  // null = closed; { btn } = open and showing info about `btn`.
+  const [buttonModal,      setButtonModal]      = useState(null);
+
   // --- Search state ---
   const [searchQuery, setSearchQuery] = useState('');
   const [allMatches, setAllMatches] = useState([]);
   const [searchMatchIndex, setSearchMatchIndex] = useState(0);
+
+  // ── Phase 1.4 patch: Form calculation engine ──────────────────────────────
+  // Whenever formValues changes (user types in a source field), re-run all
+  // AFSimple_Calculate scripts and update formValues for every calculated field.
+  // Calculated fields are identified by having a non-null script_calc string.
+  //
+  // To avoid an infinite update loop, values are only set when they differ from
+  // the current computed result — so the effect settles in at most two renders.
+  useEffect(() => {
+    if (!formFields || !hasCalculations) return;
+
+    // Build { calculatedFieldName: { op, sourceFields } } from the fields list.
+    // This is cheap to rebuild on each effect run (field list is stable).
+    const calcMap = {};
+    formFields.forEach(f => {
+      if (f.script_calc) {
+        const parsed = parseCalcScript(f.script_calc);
+        if (parsed) calcMap[f.name] = parsed;
+      }
+    });
+    if (!Object.keys(calcMap).length) return;
+
+    const updates = {};
+    for (const [fieldName, { op, sourceFields }] of Object.entries(calcMap)) {
+      const nums = sourceFields.map(src => {
+        const raw = formValues[src];
+        const n   = parseFloat(raw);
+        return Number.isFinite(n) ? n : 0;
+      });
+      const result  = runCalcOp(op, nums);
+      const display = formatCalcResult(result);
+      // Only update if the stored value differs from the newly computed one.
+      if ((formValues[fieldName] ?? '') !== display) {
+        updates[fieldName] = display;
+      }
+    }
+
+    if (Object.keys(updates).length > 0) {
+      setFormValues(prev => ({ ...prev, ...updates }));
+    }
+  }, [formValues, formFields, hasCalculations]);
 
   // --- Annotation state (past/present/future pattern for undo + redo) ---
   const [annotationHistory, setAnnotationHistory] = useState({ past: [], present: {}, future: [] });
@@ -420,11 +580,46 @@ const [openStickyId, setOpenStickyId] = useState(null);
     setPageManagementMode(false);
 
     let cancelled = false;
+
+    // Reset any leftover password-prompt state from a previous file
+    setPdfOpenPasswordCallback(null);
+    setPdfOpenPasswordError(false);
+    setPdfOpenPasswordValue('');
+
+    // Reset form-filling and button state from any previously open file
+    setFormFields(null);
+    setFormValues({});
+    setPdfButtons(null);
+    setButtonModal(null);
+    setHasCalculations(false);
+    setXfaBanner(false);
+    setPageDimensions({});
+
     const loadingTask = pdfjsLib.getDocument(activePdfUrl);
+
+    // ── Handle password-protected PDFs ──────────────────────────────────────
+    // PDF.js calls this whenever a password is needed (first attempt) or was
+    // wrong (subsequent attempt). We surface a prompt instead of the generic
+    // "damaged file" error screen. Once the user types a password and submits
+    // we call updatePassword() and PDF.js retries automatically.
+    loadingTask.onPassword = (updatePassword, reason) => {
+      if (cancelled) return;
+      const isWrong = reason === pdfjsLib.PasswordResponses.INCORRECT_PASSWORD;
+      setPdfOpenPasswordError(isWrong);
+      setPdfOpenPasswordValue('');
+      // Store the callback — calling it will resume PDF.js's open attempt
+      setPdfOpenPasswordCallback(() => updatePassword);
+      // Make sure the loading spinner is hidden so the prompt is visible
+      setIsLoading(false);
+    };
 
     loadingTask.promise
       .then(async doc => {
         if (cancelled) return;
+        // Password was accepted (or file was not protected) — dismiss any prompt
+        setPdfOpenPasswordCallback(null);
+        setPdfOpenPasswordError(false);
+        setPdfOpenPasswordValue('');
         setPdfDoc(doc);
         setNumPages(doc.numPages);
         setIsLoading(false);
@@ -469,9 +664,79 @@ const [openStickyId, setOpenStickyId] = useState(null);
             console.warn('KindPDF: could not load saved annotations:', err);
           }
         }
+
+        // ── Phase 1.4: Page dimensions + form fields ───────────────────────
+        // Collect the natural (scale=1, rotation=0) dimensions for every page.
+        // FormOverlay multiplies these by the current scale to convert the
+        // backend's normalised 0–1 rects into pixel positions.
+        const dims = {};
+        for (let i = 1; i <= doc.numPages; i++) {
+          try {
+            const pg = await doc.getPage(i);
+            const vp = pg.getViewport({ scale: 1, rotation: 0 });
+            dims[i] = { width: vp.width, height: vp.height };
+          } catch (_) { /* skip — FormOverlay silently skips pages without dims */ }
+        }
+        if (!cancelled) setPageDimensions(dims);
+
+        // Fetch form field and button definitions from the backend.
+        // Failures are silently ignored — the PDF just opens without form mode.
+        if (activePdfFilename && !cancelled) {
+          try {
+            const formRes = await fetch(
+              `http://localhost:5000/api/form-fields/${encodeURIComponent(activePdfFilename)}`
+            );
+            if (!cancelled && formRes.ok) {
+              const formData = await formRes.json();
+              if (!cancelled) {
+                if (formData.xfa) {
+                  // XFA dynamic form — show warning banner, no overlay
+                  setXfaBanner(true);
+                  setPdfButtons([]);
+                } else {
+                  // New response shape: { fields: [...], buttons: [...] }
+                  // We also accept the old shape (plain array) for safety.
+                  const fieldsArr  = Array.isArray(formData)
+                    ? formData                         // legacy
+                    : (formData.fields  || []);
+                  const buttonsArr = Array.isArray(formData)
+                    ? []                               // legacy — no buttons
+                    : (formData.buttons || []);
+
+                  // ── Fillable fields ──
+                  setFormFields(fieldsArr.length > 0 ? fieldsArr : []);
+                  if (fieldsArr.length > 0) {
+                    // Seed formValues from each field's existing PDF value so
+                    // pre-filled forms (and re-opened saved forms) show their
+                    // current content immediately.
+                    const initial = {};
+                    fieldsArr.forEach(f => { initial[f.name] = f.value ?? ''; });
+                    setFormValues(initial);
+                    // Detect calculated fields — any field with a script_calc string
+                    setHasCalculations(fieldsArr.some(f => !!f.script_calc));
+                  }
+
+                  // ── Push-buttons ──
+                  setPdfButtons(buttonsArr);
+                }
+              }
+            }
+          } catch (err) {
+            console.warn('KindPDF: could not load form fields:', err);
+          }
+        }
       })
       .catch(err => {
         if (cancelled) return;
+        // If onPassword is currently showing a prompt, the promise rejects when the
+        // user cancels (we call updatePassword with an empty string). In that case
+        // pdfOpenPasswordCallback is already null (we clear it on cancel) so we check
+        // the error name to avoid overwriting the UI with a generic error message.
+        if (err?.name === 'PasswordException') {
+          // onPassword already handled the UI — nothing more to do here
+          setIsLoading(false);
+          return;
+        }
         console.error('PDF load error:', err);
         setError('Sorry, we could not open that file. It may be damaged or in an unsupported format.');
         setIsLoading(false);
@@ -993,7 +1258,6 @@ const [openStickyId, setOpenStickyId] = useState(null);
     }
   }, [selectedPages, activePdfFilename]);
 
-  // Called after a successful PDF merge: reload the viewer with the new merged file.
   const handleMergeComplete = useCallback((newFilename, newNumPages) => {
     const newUrl = `http://localhost:5000/api/pdf/${encodeURIComponent(newFilename)}`;
     // Updating activePdfUrl triggers the pdfDoc load useEffect, which resets
@@ -1572,6 +1836,27 @@ else if (activeTool === 'sticky') {
 
 
   // ============================================================
+  // FORM — PUSH-BUTTON HANDLER
+  // ============================================================
+  //
+  // Called when the user clicks a ButtonOverlay button.  We handle the
+  // actions KindPDF can perform natively (print) and show an honest,
+  // plain-English dialog for everything else rather than silently failing.
+
+  const handleButtonClick = useCallback((btn) => {
+    if (btn.action_type === 'print') {
+      // window.print() triggers the browser's native print dialog which
+      // works well for PDFs rendered inside the page.
+      window.print();
+      return;
+    }
+    // For all other action types, open the informational dialog so the user
+    // knows what the button *would* do and what to do instead.
+    setButtonModal({ btn });
+  }, []);
+
+
+  // ============================================================
   // ANNOTATION — SAVE PDF (with native Save As dialog)
   // ============================================================
 
@@ -1593,6 +1878,10 @@ else if (activeTool === 'sticky') {
           annotations,
           pageOrder:     pageOrder.length > 0 ? pageOrder : undefined,
           pageRotations: Object.keys(pageRotations).length > 0 ? pageRotations : undefined,
+          // Form field values — included whenever the PDF has fillable fields.
+          // Backend writes them as live (non-flattened) AcroForm fields so they
+          // remain editable when the saved PDF is re-opened.
+          formValues:    Object.keys(formValues).length > 0 ? formValues : undefined,
         }),
       });
 
@@ -1638,7 +1927,7 @@ else if (activeTool === 'sticky') {
     } finally {
       setIsSaving(false);
     }
-  }, [activePdfFilename, pdfName, annotations, pageOrder, pageRotations]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [activePdfFilename, pdfName, annotations, pageOrder, pageRotations, formValues]); // eslint-disable-line react-hooks/exhaustive-deps
 
 
   // ============================================================
@@ -1704,7 +1993,9 @@ else if (activeTool === 'sticky') {
         }}
         scale={scale}
         onZoomIn={zoomIn} onZoomOut={zoomOut} onFitToScreen={fitToScreen}
+        onZoomTo={v => setScale(Math.min(Math.max(v, 0.1), 4.0))}
         onToggleSidebar={() => setSidebarOpen(o => !o)} onClose={onClose} pdfName={pdfName}
+        onProtectUnlock={() => setPasswordModalOpen(true)}
         searchQuery={searchQuery} onSearchChange={setSearchQuery}
         onSearchSubmit={() => allMatches.length > 0 ? handleSearchNext() : runSearch(searchQuery)}
         searchMatchCount={totalMatchCount} searchMatchIndex={searchMatchIndex}
@@ -1769,6 +2060,43 @@ else if (activeTool === 'sticky') {
           >
             ✕ Cancel
           </button>
+        </div>
+      )}
+
+      {/* ── XFA form warning banner (Phase 1.4) ──────────────────────────────
+          Shown when the opened PDF uses Adobe's XFA format, which KindPDF cannot
+          render interactively. Directs the user to open the file in Acrobat Reader.
+      ── */}
+      {xfaBanner && (
+        <div className="bg-amber-50 border-b border-amber-300 px-4 py-2.5 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2.5">
+            <span className="text-lg" aria-hidden="true">⚠️</span>
+            <span className="text-sm font-medium text-amber-800">
+              This PDF uses a special Adobe format that KindPDF can't fill in yet.
+              Try opening it in <strong>Adobe Acrobat Reader</strong> (free) instead.
+            </span>
+          </div>
+          <button
+            onClick={() => setXfaBanner(false)}
+            title="Dismiss this message"
+            aria-label="Dismiss XFA warning"
+            className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-amber-200 hover:bg-amber-300 text-amber-900 text-sm font-medium transition-colors flex-shrink-0"
+          >
+            ✕ Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* ── Form calculations info banner (Phase 1.4 patch) ────────────────────
+          Shown when the PDF has computed fields (qty × price = total, etc.).
+          Lets the user know values will update automatically as they type.
+      ── */}
+      {hasCalculations && formFields && formFields.length > 0 && (
+        <div className="bg-blue-50 border-b border-blue-200 px-4 py-2 flex items-center gap-2.5">
+          <span className="text-base" aria-hidden="true">🧮</span>
+          <span className="text-sm text-blue-800">
+            This form has automatic calculations — totals will update as you type.
+          </span>
         </div>
       )}
 
@@ -1943,12 +2271,298 @@ else if (activeTool === 'sticky') {
                   ))
                 }
 
+                {/* ── Form field HTML overlays (Phase 1.4) ───────────────────────────
+                    Always rendered whenever the PDF has fillable fields.
+                    pageDimensions[pageNum] must exist (set after PDF loads) so that
+                    coordinate conversion from normalised 0–1 rects is accurate.
+                ── */}
+                {formFields && formFields.length > 0 && pageDimensions[pageNum] && (
+                  <FormOverlay
+                    fields={formFields}
+                    pageIndex={pageNum - 1}
+                    scale={scale}
+                    pageDimensions={pageDimensions[pageNum]}
+                    formValues={formValues}
+                    onFieldChange={(name, value) =>
+                      setFormValues(prev => ({ ...prev, [name]: value }))
+                    }
+                  />
+                )}
+
+                {/* ── Push-button HTML overlays (Phase 1.4 extension) ────────────
+                    Renders PDF push-button widgets (Print, Submit, etc.) as HTML
+                    buttons. These are hidden by annotationMode:0 in the main render
+                    so we recreate them here. pageDimensions must exist first.
+                ── */}
+                {pdfButtons && pdfButtons.length > 0 && pageDimensions[pageNum] && (
+                  <ButtonOverlay
+                    buttons={pdfButtons}
+                    pageIndex={pageNum - 1}
+                    scale={scale}
+                    pageDimensions={pageDimensions[pageNum]}
+                    onButtonClick={handleButtonClick}
+                  />
+                )}
+
               </div>
             ))}
           </div>
         </div>
 
       </div>
+
+      {/* ── Button action info dialog ──────────────────────────────────── */}
+      {/* Shown when a user clicks a PDF push-button whose action KindPDF  */}
+      {/* cannot perform automatically (email submit, unknown, etc.).      */}
+      {/* We are honest about what the button would do and tell the user   */}
+      {/* what to do instead rather than silently failing.                 */}
+      {buttonModal && (() => {
+        const { btn } = buttonModal;
+        let title   = 'About this button';
+        let icon    = '🔘';
+        let message = null;
+        let instruction = null;
+
+        if (btn.action_type === 'submit') {
+          icon    = '📧';
+          title   = 'This button would send an email';
+          const mailto = btn.action_target || '';
+          const email  = mailto.replace(/^mailto:/i, '');
+          message = (
+            <>
+              In Adobe Acrobat, clicking <strong>{btn.label || 'this button'}</strong> would
+              email the filled form to <strong>{email || 'the address in the PDF'}</strong>.
+            </>
+          );
+          instruction = (
+            <>
+              KindPDF can't send email automatically.{' '}
+              <strong>Save your filled PDF</strong> using the{' '}
+              <em>Save As PDF</em> button, then attach it to an email yourself.
+            </>
+          );
+        } else if (btn.action_type === 'javascript') {
+          icon    = '⚠️';
+          title   = 'This button runs a script';
+          message = (
+            <>
+              <strong>{btn.label || 'This button'}</strong> runs a JavaScript script
+              embedded in the PDF.
+            </>
+          );
+          instruction = (
+            <>
+              KindPDF doesn't run embedded PDF scripts. To use this button,{' '}
+              open the PDF in <strong>Adobe Acrobat Reader</strong> (free download).
+            </>
+          );
+        } else if (btn.action_type === 'uri') {
+          icon    = '🔗';
+          title   = 'This button opens a link';
+          message = (
+            <>
+              <strong>{btn.label || 'This button'}</strong> would open:{' '}
+              <span className="break-all font-mono text-sm text-blue-700">{btn.action_target}</span>
+            </>
+          );
+          instruction = (
+            <>
+              Click{' '}
+              <button
+                className="text-blue-600 underline"
+                onClick={() => { window.open(btn.action_target, '_blank', 'noopener,noreferrer'); }}
+              >
+                here to open the link
+              </button>
+              {' '}in a new tab.
+            </>
+          );
+        } else if (btn.action_type === 'named') {
+          icon    = '⚙️';
+          title   = `PDF action: ${btn.action_target}`;
+          message = (
+            <>
+              <strong>{btn.label || 'This button'}</strong> triggers the built-in PDF
+              action <em>{btn.action_target}</em>.
+            </>
+          );
+          instruction = (
+            <>
+              KindPDF doesn't support this action. To use it, open the PDF in{' '}
+              <strong>Adobe Acrobat Reader</strong> (free download).
+            </>
+          );
+        } else {
+          icon    = '❓';
+          title   = 'This button\'s action is not supported';
+          message = (
+            <>
+              <strong>{btn.label || 'This button'}</strong> has an action that
+              KindPDF can't perform.
+            </>
+          );
+          instruction = (
+            <>
+              To use it, open the PDF in <strong>Adobe Acrobat Reader</strong>{' '}
+              (free download from adobe.com).
+            </>
+          );
+        }
+
+        return (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50"
+            role="dialog"
+            aria-modal="true"
+            aria-label={title}
+            onClick={e => { if (e.target === e.currentTarget) setButtonModal(null); }}
+          >
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 p-6">
+              {/* Header */}
+              <div className="flex items-center gap-3 mb-4">
+                <span className="text-2xl" aria-hidden="true">{icon}</span>
+                <h2 className="text-lg font-semibold text-gray-900">{title}</h2>
+              </div>
+
+              {/* What the button would do */}
+              <p className="text-gray-700 text-base mb-3">{message}</p>
+
+              {/* What to do instead */}
+              {instruction && (
+                <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 text-base text-blue-900 mb-5">
+                  {instruction}
+                </div>
+              )}
+
+              {/* Close button */}
+              <div className="flex justify-end">
+                <button
+                  onClick={() => setButtonModal(null)}
+                  className="px-5 py-2 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-800 font-medium text-base transition-colors"
+                >
+                  Got it
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── PDF open-password prompt (Phase 1.6) ─────────────────────── */}
+      {/* Shows when PDF.js encounters a password-protected PDF on open.  */}
+      {/* Replaces the generic "damaged file" error with a friendly prompt */}
+      {pdfOpenPasswordCallback && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50"
+          role="dialog"
+          aria-modal="true"
+          aria-label="This file is password-protected"
+        >
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-4 p-6">
+
+            {/* Header */}
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-9 h-9 rounded-full bg-amber-100 flex items-center justify-center flex-shrink-0">
+                <svg className="w-5 h-5 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                    d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                </svg>
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900">This file is password-protected</h2>
+                <p className="text-sm text-gray-500">Enter the password to open it</p>
+              </div>
+            </div>
+
+            {/* Wrong-password feedback */}
+            {pdfOpenPasswordError && (
+              <div className="flex items-center gap-2 text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-3">
+                <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                    d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+                <p className="text-base">That password is incorrect — please try again.</p>
+              </div>
+            )}
+
+            {/* Password input */}
+            <div className="mb-4">
+              <label htmlFor="pdf-open-pw" className="block text-base font-medium text-gray-800 mb-1">
+                Password
+              </label>
+              <input
+                id="pdf-open-pw"
+                type="password"
+                value={pdfOpenPasswordValue}
+                onChange={e => setPdfOpenPasswordValue(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && pdfOpenPasswordValue) {
+                    const cb = pdfOpenPasswordCallback;
+                    setPdfOpenPasswordCallback(null);
+                    cb(pdfOpenPasswordValue);
+                  }
+                  if (e.key === 'Escape') {
+                    // User cancelled — clear prompt and go back to home
+                    setPdfOpenPasswordCallback(null);
+                    setPdfOpenPasswordError(false);
+                    setPdfOpenPasswordValue('');
+                    if (onClose) onClose();
+                  }
+                }}
+                placeholder="Enter the file's password"
+                title="Type the password for this PDF file"
+                aria-label="Password for this PDF file"
+                autoFocus
+                autoComplete="current-password"
+                className="w-full border border-gray-300 rounded-lg py-2.5 px-3 text-base
+                           focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              />
+            </div>
+
+            {/* Buttons */}
+            <div className="flex items-center justify-end gap-3">
+              <button
+                onClick={() => {
+                  setPdfOpenPasswordCallback(null);
+                  setPdfOpenPasswordError(false);
+                  setPdfOpenPasswordValue('');
+                  if (onClose) onClose();
+                }}
+                title="Cancel and go back to the file picker"
+                aria-label="Cancel"
+                className="flex items-center gap-2 px-4 py-2.5 rounded-lg border border-gray-300
+                           text-base font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  if (!pdfOpenPasswordValue) return;
+                  const cb = pdfOpenPasswordCallback;
+                  setPdfOpenPasswordCallback(null);
+                  cb(pdfOpenPasswordValue);
+                }}
+                disabled={!pdfOpenPasswordValue}
+                title="Submit this password and open the file"
+                aria-label="Open file"
+                className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-blue-600 text-white
+                           text-base font-medium hover:bg-blue-700
+                           disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                    d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" />
+                </svg>
+                Open File
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
 
       {/* ── Signature creation wizard modal ──────────────────────────── */}
       {signatureModalOpen && (
@@ -1974,6 +2588,14 @@ else if (activeTool === 'sticky') {
           currentFilename={activePdfFilename}
           onClose={() => setMergeModalOpen(false)}
           onMergeComplete={handleMergeComplete}
+        />
+      )}
+
+      {/* ── Password Settings modal (Phase 1.6) ──────────────────────── */}
+      {passwordModalOpen && (
+        <PasswordModal
+          filename={activePdfFilename}
+          onClose={() => setPasswordModalOpen(false)}
         />
       )}
 

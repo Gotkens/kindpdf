@@ -2,7 +2,9 @@
 # KindPDF — Flask Backend
 # Phase 1.2: Annotation saving added
 # Phase 1.3: Annotation round-trip reading added
+# Phase 1.4: Form filling added (AcroForm read + save, XFA detection)
 # Phase 1.5: Page management added (reorder, delete, rotate, extract, merge)
+# Phase 1.6: Password protect / unlock added
 #
 # Routes:
 #   GET  /api/hello                    — health check (Phase 0)
@@ -12,8 +14,13 @@
 #   GET  /api/annotations/<filename>   — read existing native PDF annotations for round-trip loading
 #   POST /api/extract-pages            — extract selected pages into a new PDF
 #   POST /api/merge-pdf                — merge a second PDF into the current one at a given position
+#   GET  /api/form-fields/<filename>   — read AcroForm widgets (or detect XFA) for form filling
+#   POST /api/save-form                — write filled field values and return the completed PDF
+#   POST /api/protect-pdf              — save a password-protected copy of a PDF (AES-256)
+#   POST /api/unlock-pdf               — remove password protection from a PDF
 
 import os
+import re
 import uuid
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -358,6 +365,87 @@ def get_annotations(filename):
     return jsonify(loaded_annotations)
 
 
+def pdf_string(s):
+    """
+    Encode a Python string as a PDF parentheses-delimited string literal,
+    with all characters that need escaping properly handled.
+
+    Used as a fallback when widget.update() fails (e.g. on calculated fields
+    whose appearance stream creation triggers a PyMuPDF internal error).
+    We write the /V key directly via doc.xref_set_key() instead.
+    """
+    s = str(s) if s is not None else ''
+    s = s.replace('\\', '\\\\')
+    s = s.replace('(', '\\(')
+    s = s.replace(')', '\\)')
+    s = s.replace('\r', '\\r')
+    s = s.replace('\n', '\\n')
+    return f'({s})'
+
+
+def set_widget_value(doc, widget, new_value):
+    """
+    Set a form widget's value and attempt to regenerate its appearance stream.
+
+    widget.update() can fail with "cannot create array without a document" on
+    calculated fields (and occasionally others with complex appearance streams).
+    When that happens we fall back to writing /V directly via doc.xref_set_key(),
+    which persists the value correctly — PDF viewers read /V regardless of whether
+    the appearance stream is stale.
+    """
+    type_str = widget.field_type_string
+
+    # Set the in-memory value so widget.update() (if it works) writes it fully.
+    if type_str == 'CheckBox':
+        is_on = (isinstance(new_value, bool) and new_value) or \
+                str(new_value).lower() in ('true', '1', 'yes', 'on')
+        widget.field_value = is_on
+    elif type_str == 'RadioButton':
+        export = ''
+        try:
+            export = widget.on_state_value or ''
+        except AttributeError:
+            pass
+        widget.field_value = (str(new_value) == str(export))
+    else:
+        widget.field_value = str(new_value) if new_value is not None else ''
+
+    try:
+        widget.update()  # Regenerates appearance stream — fast path
+        return
+    except Exception:
+        pass  # Fall through to the xref fallback below
+
+    # ── xref fallback ───────────────────────────────────────────────────────
+    # Write the /V (and /AS for toggle fields) key directly into the widget's
+    # PDF dictionary.  This skips appearance regeneration but the stored value
+    # is correct and PDF viewers render it from /V + /DA.
+    try:
+        xref = widget.xref
+        if type_str == 'CheckBox':
+            is_on = (isinstance(new_value, bool) and new_value) or \
+                    str(new_value).lower() in ('true', '1', 'yes', 'on')
+            state = '/Yes' if is_on else '/Off'
+            doc.xref_set_key(xref, 'V',  state)
+            doc.xref_set_key(xref, 'AS', state)
+        elif type_str == 'RadioButton':
+            export = ''
+            try:
+                export = widget.on_state_value or ''
+            except AttributeError:
+                pass
+            is_on = (str(new_value) == str(export))
+            state = f'/{export}' if is_on else '/Off'
+            doc.xref_set_key(xref, 'V',  state)
+            doc.xref_set_key(xref, 'AS', state)
+        else:
+            doc.xref_set_key(xref, 'V', pdf_string(
+                str(new_value) if new_value is not None else ''
+            ))
+    except Exception as e:
+        print(f'KindPDF: xref fallback also failed for widget {widget.field_name!r}: {e}')
+
+
 @app.route('/api/save-annotations', methods=['POST'])
 def save_annotations():
     """
@@ -410,6 +498,10 @@ def save_annotations():
     # page_rotations: { "origPageNum": additionalDegrees }.
     # Uses original 1-based page numbers as string keys.
     page_rotations = data.get('pageRotations', {})
+    # form_values: { "fieldName": value } — optional; supplied when the PDF has
+    # fillable AcroForm fields and the user has filled or changed any values.
+    # Written as LIVE (non-flattened) fields so they remain editable after re-open.
+    form_values = data.get('formValues', {})
 
     if not filename:
         return jsonify({'error': 'No filename provided.'}), 400
@@ -601,6 +693,24 @@ def save_annotations():
                         # keep_proportion=False fills the rect exactly as positioned by the user
                         page.insert_image(rect, stream=image_bytes, keep_proportion=False)
 
+        # ── Step 4: Write form field values (if any) ───────────────────────────
+        # Applies only when the PDF has AcroForm widgets and the user filled some in.
+        # Values are written as LIVE interactive fields — NOT flattened — so the
+        # fields remain editable when the saved PDF is re-opened in KindPDF or any
+        # other viewer. The /api/form-fields endpoint reads current values on next
+        # open, so the round-trip just works automatically.
+        #
+        # set_widget_value() handles the crash that occurs with calculated fields:
+        # widget.update() throws "cannot create array without a document" on those
+        # fields, so we fall back to writing /V via doc.xref_set_key() instead.
+        if form_values:
+            for page in doc:
+                for widget in page.widgets():
+                    field_name = widget.field_name or ''
+                    if field_name not in form_values:
+                        continue
+                    set_widget_value(doc, widget, form_values[field_name])
+
         # Save annotated PDF to a new file
         output_filename = f'annotated_{safe_filename}'
         output_path = os.path.join(UPLOAD_FOLDER, output_filename)
@@ -765,6 +875,483 @@ def merge_pdf():
     except Exception as e:
         print(f'Error merging PDFs: {e}')
         return jsonify({'error': f'Something went wrong while merging the files: {str(e)}'}), 500
+
+
+@app.route('/api/form-fields/<filename>')
+def get_form_fields(filename):
+    """
+    Read AcroForm widget fields from a PDF and return them as JSON.
+
+    XFA detection first: XFA is Adobe's proprietary dynamic form format that
+    PyMuPDF cannot reliably render. We scan every xref object for the /XFA
+    key — if found we return {xfa: true} immediately so the frontend can show
+    a friendly fallback message instead of broken overlays.
+
+    For standard AcroForm PDFs we return a JSON array of field objects. Each
+    object has:
+      name        — field name string
+      page        — 0-based page index
+      rect        — {x0, y0, x1, y1} normalized to 0–1 fractions of page size
+                    so coordinates survive zoom and resize changes
+      type        — "text" | "checkbox" | "radio" | "dropdown" | "listbox"
+      value       — current value (string, or bool for checkboxes)
+      exportValue — export value for radio buttons (identifies which button)
+      options     — list of choice strings (dropdown / listbox only)
+      readonly    — true if PDF_FIELD_FLAG_READ_ONLY is set (bit 0 of flags)
+
+    Push-button (Button) and Signature widgets are skipped — they are not
+    user-fillable text/choice fields.
+    """
+    try:
+        import fitz
+    except ImportError:
+        return jsonify({'error': 'PyMuPDF is required for form reading.'}), 500
+
+    safe_filename = secure_filename(filename)
+    filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
+
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'File not found. Please re-open it and try again.'}), 404
+
+    try:
+        doc = fitz.open(filepath)
+
+        # ── XFA detection ───────────────────────────────────────────────────
+        # Scan every xref object for the string "/XFA" rather than walking
+        # the object tree, because the AcroForm dict may be compressed or behind
+        # an indirect reference that varies by PDF writer.
+        xfa_found = False
+        for xref in range(1, doc.xref_length()):
+            try:
+                if '/XFA' in doc.xref_object(xref, compressed=False):
+                    xfa_found = True
+                    break
+            except Exception:
+                pass  # Malformed xref object — skip and keep scanning
+
+        if xfa_found:
+            doc.close()
+            return jsonify({'xfa': True})
+
+        # ── Field-type mapping ──────────────────────────────────────────────
+        TYPE_MAP = {
+            'Text':        'text',
+            'CheckBox':    'checkbox',
+            'RadioButton': 'radio',
+            'ComboBox':    'dropdown',
+            'ListBox':     'listbox',
+        }
+
+        fields  = []
+        buttons = []
+
+        for page_idx in range(doc.page_count):
+            page = doc[page_idx]
+            pw   = page.rect.width   # page width  in PDF points
+            ph   = page.rect.height  # page height in PDF points
+
+            for widget in page.widgets():
+                type_str = widget.field_type_string
+
+                # ── Push-button: extract action info instead of skipping ──────
+                if type_str == 'Button':
+                    r = widget.rect
+                    norm_rect = {
+                        'x0': r.x0 / pw,
+                        'y0': r.y0 / ph,
+                        'x1': r.x1 / pw,
+                        'y1': r.y1 / ph,
+                    }
+
+                    # Read the button label from the MK/CA entry (normal caption)
+                    label = widget.field_name or ''
+                    try:
+                        mk = doc.xref_get_key(widget.xref, 'MK')
+                        if mk and isinstance(mk, tuple) and mk[0] == 'dict':
+                            # Walk the MK dict to find the CA entry
+                            mk_str = mk[1]
+                            ca_match = re.search(r'/CA\s*\(([^)]*)\)', mk_str)
+                            if ca_match:
+                                label = ca_match.group(1)
+                    except Exception:
+                        pass
+
+                    # Determine action type from the widget's /A action dict
+                    action_type   = 'unknown'
+                    action_target = ''
+                    try:
+                        action_xref = doc.xref_get_key(widget.xref, 'A')
+                        if action_xref and isinstance(action_xref, tuple):
+                            # If the action is an indirect reference, follow it
+                            if action_xref[0] == 'xref':
+                                ref_xref = int(action_xref[1].split()[0])
+                                action_str = doc.xref_object(ref_xref, compressed=False)
+                            else:
+                                action_str = action_xref[1] if action_xref[0] == 'dict' else ''
+                            # Named action (e.g. /N /Print, /N /NextPage)
+                            named_match = re.search(r'/S\s*/Named.*?/N\s*/(\w+)', action_str, re.DOTALL)
+                            if named_match:
+                                named_action = named_match.group(1).lower()
+                                if named_action == 'print':
+                                    action_type = 'print'
+                                else:
+                                    action_type   = 'named'
+                                    action_target = named_match.group(1)
+                            else:
+                                # SubmitForm action with mailto URL
+                                submit_match = re.search(r'/S\s*/SubmitForm', action_str)
+                                if submit_match:
+                                    url_match = re.search(r'/F\s*<<[^>]*?/F\s*\(([^)]+)\)', action_str)
+                                    if url_match:
+                                        action_type   = 'submit'
+                                        action_target = url_match.group(1)
+                                    else:
+                                        action_type = 'submit'
+                                else:
+                                    # JavaScript action
+                                    js_match = re.search(r'/S\s*/JavaScript', action_str)
+                                    if js_match:
+                                        action_type = 'javascript'
+                                    # URI action
+                                    uri_match = re.search(r'/S\s*/URI.*?/URI\s*\(([^)]+)\)', action_str, re.DOTALL)
+                                    if uri_match:
+                                        action_type   = 'uri'
+                                        action_target = uri_match.group(1)
+                    except Exception:
+                        pass
+
+                    buttons.append({
+                        'name':          widget.field_name or '',
+                        'page':          page_idx,
+                        'rect':          norm_rect,
+                        'label':         label,
+                        'action_type':   action_type,
+                        'action_target': action_target,
+                    })
+                    continue  # Don't add buttons to the fillable fields list
+
+                if type_str == 'Signature':
+                    continue  # Signature widgets are not fillable
+
+                kind = TYPE_MAP.get(type_str)
+                if kind is None:
+                    continue  # Unknown type — skip safely
+
+                r = widget.rect
+                # Normalize rect to 0–1 fractions of page dimensions so
+                # coordinates are zoom-independent. The overlay multiplies
+                # back by (pageDimPts × scale) to get pixel positions.
+                norm_rect = {
+                    'x0': r.x0 / pw,
+                    'y0': r.y0 / ph,
+                    'x1': r.x1 / pw,
+                    'y1': r.y1 / ph,
+                }
+
+                # PDF_FIELD_FLAG_READ_ONLY = bit position 1 (integer value 1)
+                readonly = bool(widget.field_flags & 1)
+
+                # Coerce value to a clean Python type
+                raw_val = widget.field_value
+                if raw_val is None:
+                    raw_val = ''
+                elif not isinstance(raw_val, bool):
+                    raw_val = str(raw_val)
+
+                # Read the widget's Acrobat JavaScript calculation script.
+                # Most fields return None. Calculated fields (totals, products)
+                # have a string like:
+                #   AFSimple_Calculate("PRD", new Array("qty", "price"))
+                # The frontend parses this to re-run calculations client-side
+                # whenever a source field value changes, no JS engine required.
+                script_calc = None
+                try:
+                    sc = widget.script_calc
+                    script_calc = sc if sc else None
+                except AttributeError:
+                    pass  # PyMuPDF version does not expose script_calc — safe to ignore
+
+                field_obj = {
+                    'name':        widget.field_name or '',
+                    'page':        page_idx,
+                    'rect':        norm_rect,
+                    'type':        kind,
+                    'value':       raw_val,
+                    'exportValue': '',          # filled below for radio buttons
+                    'options':     [],          # filled below for dropdowns
+                    'readonly':    readonly,
+                    'script_calc': script_calc, # JS calc string or null
+                }
+
+                # Radio buttons: the export value identifies this specific
+                # button in the group so the frontend can check/uncheck it.
+                if kind == 'radio':
+                    try:
+                        field_obj['exportValue'] = widget.on_state_value or ''
+                    except AttributeError:
+                        field_obj['exportValue'] = ''
+
+                # Dropdown / listbox: return selectable options list.
+                if kind in ('dropdown', 'listbox'):
+                    try:
+                        field_obj['options'] = list(widget.choice_values or [])
+                    except Exception:
+                        field_obj['options'] = []
+
+                fields.append(field_obj)
+
+        doc.close()
+        # Return both fillable fields and push-button definitions together.
+        # The frontend uses fields[] for the FormOverlay and buttons[] for
+        # the ButtonOverlay (HTML buttons rendered over the PDF canvas).
+        return jsonify({'fields': fields, 'buttons': buttons})
+
+    except Exception as e:
+        print(f'KindPDF: error reading form fields from {safe_filename}: {e}')
+        return jsonify({'error': f'Could not read form fields: {str(e)}'}), 500
+
+
+@app.route('/api/save-form', methods=['POST'])
+def save_form():
+    """
+    Write filled form-field values into a PDF and return a downloadable copy.
+
+    Accepts JSON body:
+    {
+      "filename": "uuid_original.pdf",
+      "fields":   [{"name": "FieldName", "value": "User answer"}, ...]
+    }
+
+    For each supplied field, finds every matching widget on every page,
+    coerces the value to the correct type (bool for checkboxes, str for
+    others), then calls widget.update() to regenerate the appearance stream
+    so the value is visible in every PDF viewer.
+
+    Values are written as LIVE (non-flattened) AcroForm fields so they remain
+    editable when the PDF is re-opened in KindPDF or any other viewer. Calling
+    doc.bake() was removed because it caused a "cannot create array without a
+    document" error in some PyMuPDF versions, and live fields are the correct
+    behaviour for round-trip editing anyway.
+
+    The ORIGINAL file is never modified. The filled copy is saved to a new
+    UUID filename and returned as a browser download: "filled_form.pdf".
+    """
+    try:
+        import fitz
+    except ImportError:
+        return jsonify({'error': 'PyMuPDF is required for saving forms.'}), 500
+
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data received.'}), 400
+
+    filename    = data.get('filename')
+    fields_data = data.get('fields', [])
+
+    if not filename:
+        return jsonify({'error': 'No filename provided.'}), 400
+
+    safe_filename = secure_filename(filename)
+    filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
+
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'The original file was not found. Please re-open it and try again.'}), 404
+
+    try:
+        doc = fitz.open(filepath)
+
+        # Build {field_name: new_value} for O(1) lookup
+        field_values = {
+            item['name']: item['value']
+            for item in fields_data
+            if isinstance(item, dict) and 'name' in item
+        }
+
+        # Walk every page's widgets and apply matching values.
+        # set_widget_value() handles the crash that occurs with calculated fields
+        # by falling back to xref_set_key() if widget.update() fails.
+        for page in doc:
+            for widget in page.widgets():
+                field_name = widget.field_name or ''
+                if field_name not in field_values:
+                    continue
+                set_widget_value(doc, widget, field_values[field_name])
+
+        # Save with live (non-flattened) fields so the PDF remains editable
+        # when re-opened in KindPDF or any other viewer. NOT calling doc.bake()
+        # was the cause of the "cannot create array without a document" error
+        # seen in some PyMuPDF versions, and is also the correct behaviour for
+        # round-trip editing.
+        output_filename = f'filled_{uuid.uuid4().hex}_{safe_filename}'
+        output_path     = os.path.join(UPLOAD_FOLDER, output_filename)
+        doc.save(output_path, garbage=4, deflate=True)
+        doc.close()
+
+        return send_from_directory(
+            UPLOAD_FOLDER,
+            output_filename,
+            as_attachment=True,
+            download_name='filled_form.pdf'
+        )
+
+    except Exception as e:
+        print(f'KindPDF: error saving form {safe_filename}: {e}')
+        return jsonify({'error': f'Something went wrong while saving the form: {str(e)}'}), 500
+
+
+@app.route('/api/protect-pdf', methods=['POST'])
+def protect_pdf():
+    """
+    Add AES-256 password protection to a PDF and return the protected file as a download.
+
+    The same password is used for both the user password (required to open the file)
+    and the owner password (required to change permissions). This is the simplest and
+    most common use case — the user just wants to lock the file with a password.
+
+    Expected JSON body:
+    {
+      "filename": "uuid_original.pdf",
+      "password": "mysecretpassword"
+    }
+
+    Returns the protected PDF as a file download.
+    """
+    try:
+        import fitz
+    except ImportError:
+        return jsonify({'error': 'PyMuPDF is required for password protection.'}), 500
+
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data received.'}), 400
+
+    filename = data.get('filename')
+    password = data.get('password', '')
+
+    if not filename:
+        return jsonify({'error': 'No filename provided.'}), 400
+    if not password:
+        return jsonify({'error': 'Please enter a password before protecting the file.'}), 400
+
+    safe_filename = secure_filename(filename)
+    filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
+
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'The original file was not found. Please re-open it and try again.'}), 404
+
+    try:
+        doc = fitz.open(filepath)
+
+        # If the file is already encrypted, we need to authenticate first so PyMuPDF
+        # can read and re-save it. If authentication fails, the file cannot be re-protected.
+        if doc.is_encrypted:
+            if doc.authenticate(password) == 0:
+                doc.close()
+                return jsonify({
+                    'error': 'This file is already password-protected. '
+                             'Please unlock it first before adding a new password.'
+                }), 400
+
+        output_filename = f'protected_{uuid.uuid4().hex}_{safe_filename}'
+        output_path = os.path.join(UPLOAD_FOLDER, output_filename)
+
+        # Save with AES-256 encryption.
+        # user_pw  — password required to open and read the file.
+        # owner_pw — password required to change permissions / print / copy.
+        # Using the same value for both keeps things simple for the user.
+        doc.save(
+            output_path,
+            encryption=fitz.PDF_ENCRYPT_AES_256,
+            user_pw=password,
+            owner_pw=password,
+            garbage=4,
+            deflate=True,
+        )
+        doc.close()
+
+        return send_from_directory(
+            UPLOAD_FOLDER,
+            output_filename,
+            as_attachment=True,
+            download_name='protected.pdf'
+        )
+
+    except Exception as e:
+        print(f'Error protecting PDF: {e}')
+        return jsonify({'error': f'Something went wrong while protecting the file: {str(e)}'}), 500
+
+
+@app.route('/api/unlock-pdf', methods=['POST'])
+def unlock_pdf():
+    """
+    Remove password protection from a PDF and return the unlocked file as a download.
+
+    If the supplied password is wrong, returns a 401 with a plain-English error message
+    instead of a download. The original file is never modified.
+
+    Expected JSON body:
+    {
+      "filename": "uuid_original.pdf",
+      "password": "mysecretpassword"
+    }
+
+    Returns the unlocked PDF as a file download, or:
+    { "error": "That password is incorrect — please try again." } on failure.
+    """
+    try:
+        import fitz
+    except ImportError:
+        return jsonify({'error': 'PyMuPDF is required for unlocking PDFs.'}), 500
+
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data received.'}), 400
+
+    filename = data.get('filename')
+    password = data.get('password', '')
+
+    if not filename:
+        return jsonify({'error': 'No filename provided.'}), 400
+    if not password:
+        return jsonify({'error': 'Please enter the current password for this file.'}), 400
+
+    safe_filename = secure_filename(filename)
+    filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
+
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'The original file was not found. Please re-open it and try again.'}), 404
+
+    try:
+        doc = fitz.open(filepath)
+
+        if not doc.is_encrypted:
+            doc.close()
+            return jsonify({'error': 'This file does not have a password — there is nothing to remove.'}), 400
+
+        # authenticate() returns 0 if the password is wrong.
+        # Returns 1 if correct as user password, 2 as owner password, 4 as both.
+        auth_result = doc.authenticate(password)
+        if auth_result == 0:
+            doc.close()
+            return jsonify({'error': 'That password is incorrect — please try again.'}), 401
+
+        # Save without any encryption to produce a clean, unlocked copy.
+        # PyMuPDF defaults to no encryption when the encryption parameter is omitted.
+        output_filename = f'unlocked_{uuid.uuid4().hex}_{safe_filename}'
+        output_path = os.path.join(UPLOAD_FOLDER, output_filename)
+        doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE, garbage=4, deflate=True)
+        doc.close()
+
+        return send_from_directory(
+            UPLOAD_FOLDER,
+            output_filename,
+            as_attachment=True,
+            download_name='unlocked.pdf'
+        )
+
+    except Exception as e:
+        print(f'Error unlocking PDF: {e}')
+        return jsonify({'error': f'Something went wrong while unlocking the file: {str(e)}'}), 500
 
 
 if __name__ == '__main__':

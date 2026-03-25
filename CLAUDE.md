@@ -2,7 +2,7 @@
 
 > This file is read by Claude at the start of every session.
 > Keep it updated. It is the project's memory.
-> Last updated: March 24, 2026
+> Last updated: March 25, 2026
 
 ---
 
@@ -40,8 +40,15 @@ These apply to EVERY feature. Claude must follow all of these automatically.
 10. Multi-step tasks (like signing) use a clearly numbered guided flow: 
     Step 1 of 3, Step 2 of 3, etc.
 
-**The Grandma Test:** Before any feature is considered done, ask: could 
-someone who rarely uses computers figure this out in 30 seconds without 
+11. Never mention Adobe, Acrobat, or any third-party product in any user-
+    facing message. If a PDF feature is not yet supported in KindPDF, say
+    exactly that: "This feature is not yet supported in KindPDF." Then
+    offer a plain-English workaround where one exists (e.g. for a Submit
+    button: "Save your filled PDF and email it as an attachment instead").
+    Do not tell the user to use a different app — just explain what to do.
+
+**The Grandma Test:** Before any feature is considered done, ask: could
+someone who rarely uses computers figure this out in 30 seconds without
 help? If no — simplify it.
 
 ---
@@ -88,7 +95,9 @@ kindpdf/
 │           ├── SignatureModal.js     # 3-step signature creation wizard (draw/type/upload)
 │           ├── SignatureOverlay.js   # HTML overlay for placed signatures (drag + resize)
 │           ├── ConfirmDialog.js      # Reusable confirmation modal (used by page delete)
-│           └── MergeModal.js        # 2-step merge wizard (upload second PDF + pick insert position)
+│           ├── MergeModal.js        # 2-step merge wizard (upload second PDF + pick insert position)
+│           ├── FormOverlay.js        # HTML overlay for AcroForm fillable fields (text, checkbox, radio, dropdown)
+│           └── ButtonOverlay.js     # HTML overlay for PDF push-button widgets (Print, Submit, etc.)
 ├── .gitignore
 ├── CLAUDE.md
 ├── KindPDF_Task_List.docx
@@ -109,11 +118,11 @@ kindpdf/
 
 **Phase 1.3 complete:** ✅ Yes
 
-**Phase 1.4 complete:** ☐ No
+**Phase 1.4 complete:** ✅ Yes
 
 **Phase 1.5 complete:** ✅ Yes
 
-**Phase 1.6 complete:** ☐ No
+**Phase 1.6 complete:** ✅ Yes
 
 **Phase 1.7 complete:** ☐ No
 
@@ -186,13 +195,20 @@ kindpdf/
 - ✅ Compact organize-mode thumbnails — two-column horizontal layout (~90px per card) shows many pages at once
 - ✅ Auto-scroll during drag — sidebar scrolls when cursor is within 80px of top/bottom edge, enabling moves across the full document
 - ✅ Multi-page group drag — selecting multiple pages and dragging any one moves the entire group together in relative order
+- ✅ Form filling (Phase 1.4) — detects AcroForm fields (text, checkbox, radio, dropdown, listbox); "Fill In Form" button appears when form fields exist; interactive HTML overlays match field positions at any zoom; "Save Filled Form" downloads a flattened PDF with filled values
+- ✅ XFA forms (Phase 1.4) — detected on load; friendly amber banner shown instead of broken UI ("This PDF uses a form format that KindPDF does not yet support…")
+- ✅ Zoom percentage editable — user can click the % display in toolbar, type a custom value (10–400), press Enter to apply
+- ✅ Password protection (Phase 1.6) — "Lock PDF" button opens modal with two tabs: Add Password and Remove Password; uses PyMuPDF encryption
+- ✅ Password-protected PDFs prompt for password on open instead of showing "damaged file" error; wrong-password feedback shown in plain English
+- ✅ PDF push-buttons (Print, Submit, etc.) visible in main view via ButtonOverlay — suppressed by annotationMode:0 but recreated as HTML buttons
+- ✅ PDF push-button: Print action calls window.print() directly
+- ✅ PDF push-button: Submit/email/script/URI/unknown actions show a plain-English dialog — says the feature is not yet supported in KindPDF and offers a practical workaround (e.g. save and email the PDF manually)
 
 ---
 
 ## What Is NOT Working / Known Issues
 
 - ☐ Signature round-trip not yet built — saved signatures are embedded as flat images and will not reload as editable overlays on re-open (signatures are rarely edited after placement; acceptable for Phase 1.3)
-- ☐ No form filling yet (Phase 1.4) — next phase
 - ☐ Annotation coordinates for rotated pages: annotations placed BEFORE rotation may visually shift. Annotations placed AFTER rotation work correctly.
 - ☐ Docker not yet set up (Phase 1.7)
 
@@ -259,9 +275,39 @@ for textboxes created elsewhere.
 
 ## Last Session Summary
 
-**Date:** March 24, 2026 (Phase 1.5 — Page Management + Bug Fixes)
+**Date:** March 25, 2026 (Phase 1.4 extension — PDF push-button overlay)
 
-**What we did:** Built the complete Phase 1.5 Page Management feature set, then fixed three bugs reported after initial testing.
+**What we did:** Added PDF push-button support (the buttons that appear in PDFs like Print and Submit Order). These were previously invisible in the main view because KindPDF uses `annotationMode: 0` when rendering pages. We added a `ButtonOverlay.js` component that renders HTML buttons at the correct positions, and extended the backend `/api/form-fields` endpoint to also return button definitions.
+
+**Phase 1.4 extension — PDF push-button overlay:**
+- `ButtonOverlay.js` (new component) — per-page HTML buttons positioned over the canvas using the same normalised 0–1 rect → pixel system as FormOverlay. Renders a grey gradient button matching a basic PDF button appearance.
+- Backend `get_form_fields`: now iterates Button widgets instead of skipping them. Reads the label from MK/CA dict entry. Reads action type from the /A action dict: Named→`print`/`named`, SubmitForm→`submit` (with mailto target), JavaScript→`javascript`, URI→`uri`, else→`unknown`. Follows indirect xref references for /A dicts.
+- `/api/form-fields` now returns `{ fields: [...], buttons: [...] }` instead of a plain array. Frontend handles both shapes for backward compatibility.
+- `PDFViewer.js` additions: `pdfButtons` state, `buttonModal` state, `handleButtonClick` callback. Print action calls `window.print()` directly. All other actions open a plain-English modal dialog explaining what the button would do and what to do instead (consistent with the philosophy of being honest about PDF features KindPDF can't support).
+- Button action modal: different content per action type — Submit shows the email address and says "This feature is not yet supported in KindPDF" with workaround (save PDF and email it manually); JavaScript says feature not yet supported; URI opens the link in a new tab; unknown says feature not yet supported. **No mention of Adobe or any third-party product anywhere in user-facing text.**
+
+**Phase 1.6 — Password Protection:**
+- `POST /api/protect-pdf` — accepts `{filename, password}`, encrypts with PyMuPDF `doc.save(..., encryption=fitz.PDF_ENCRYPT_AES_256)`, returns new PDF as download
+- `POST /api/unlock-pdf` — accepts `{filename, password}`, opens locked PDF, saves without encryption, returns new PDF
+- `PasswordModal.js` — two-tab modal ("Add a Password" / "Remove Password"), plain English labels, success/error messages
+- Bug fix: password-protected PDFs were showing "damaged file" error. Fixed by adding `loadingTask.onPassword = (updatePassword, reason)` in `PDFViewer.js` to intercept the password exception and show a friendly inline prompt with wrong-password feedback
+
+**Editable Zoom input:**
+- Toolbar.js zoom percentage display changed from read-only `<span>` to editable `<input type="number">` (10–400 range)
+- Validates and applies on Enter or blur; reverts to current scale on invalid input; Escape cancels edit
+- `onZoomTo` prop added to Toolbar and wired to `setScale` in PDFViewer
+
+**Phase 1.4 — Form Filling:**
+- `GET /api/form-fields/<filename>` — scans PDF for AcroForm widgets; detects XFA forms via xref scan (checking for `/XFA` string); returns `{xfa: true}` for XFA PDFs, or JSON array of field objects with: page (0-based), name, type (text/checkbox/radio/dropdown/listbox), rect (normalized 0–1 fractions), value, readonly, exportValue (radio), options (dropdown/listbox)
+- `POST /api/save-form` — accepts `{filename, fields:[{name,value}]}`; coerces types per widget kind; calls `widget.update()`; tries `doc.bake()` to flatten; returns new PDF as download
+- `FormOverlay.js` (new component) — per-page HTML overlay for interactive form fields; coordinate conversion: `fraction × pageDimPts × scale`; text inputs with blue tint at rest / white on focus; checkboxes, radio groups, dropdowns
+- `PDFViewer.js` additions: `formFields`, `formValues`, `fillFormMode`, `xfaBanner`, `isSavingForm`, `pageDimensions` state; page-dims fetched on load via `getViewport({scale:1,rotation:0})`; form fields fetched after dims; `handleSaveFilledForm` callback; XFA amber banner; `<FormOverlay>` inside page render loop
+- `Toolbar.js` additions: "Fill In Form" button (icon + text, blue when active, hidden when no form fields); "Save Filled Form" green button with spinner (shown only in fill mode)
+
+**Key technical notes:**
+- XFA detection: brute-force scan all xref objects for `/XFA` string — direct object-tree navigation fails for compressed/indirect refs
+- Normalized rects (0–1 fractions of page dimensions) ensure field positions survive zoom changes
+- `doc.bake()` (PyMuPDF ≥ 1.22) flattens fields to permanent content; gracefully falls back on older versions
 
 **Architecture — staged page changes:**
 - `pageHistory` state in `PDFViewer.js` uses the same past/present/future undo pattern
@@ -324,14 +370,24 @@ for textboxes created elsewhere.
 
 ## Next Session Goal
 
-Phase 1.4 — Form Filling:
-- Detect existing form fields in PDFs (text inputs, checkboxes, radio buttons, dropdowns)
-- Allow users to fill in those fields interactively
-- Save the filled form to PDF (flattened or with live form data)
+**Before starting Phase 1.7, do these two clean-up tasks first:**
 
-Phase 1.6 — Password-protect / Unlock PDFs:
-- Allow adding a password to a PDF before saving
-- Allow removing a password from an already-unlocked PDF
+1. **Remove all Adobe/Acrobat references from button action dialogs** in
+   `PDFViewer.js` (the `handleButtonClick` modal JSX). Replace every
+   "open in Adobe Acrobat Reader" instruction with "This feature is not yet
+   supported in KindPDF." and a practical workaround where one exists. No
+   third-party product names in any user-facing message.
+
+2. **Add a Print button to the KindPDF toolbar** (`Toolbar.js`) so users
+   can print the current PDF without needing an embedded Print push-button
+   in the PDF itself. The button should call `window.print()`. Icon + text
+   label required (design rule #1). Tooltip: "Print this PDF."
+
+**Then proceed to Phase 1.7 — Docker deployment:**
+- Write Dockerfile for backend (Python/Flask)
+- Write Dockerfile for frontend (React build → nginx)
+- Write docker-compose.yml (backend + frontend + PostgreSQL)
+- Add README setup instructions for self-hosting
 
 ---
 
@@ -339,6 +395,8 @@ Phase 1.6 — Password-protect / Unlock PDFs:
 
 | Date | What Was Accomplished |
 |---|---|
+| March 25, 2026 | Phase 1.4 extension: PDF push-button overlay (ButtonOverlay.js, handleButtonClick, honest action modal); backend /api/form-fields extended to return buttons array |
+| March 25, 2026 | Phase 1.4 (Form Filling) + Phase 1.6 (Password Protection) + editable zoom input; FormOverlay.js, PasswordModal.js, backend /api/form-fields, /api/save-form, /api/protect-pdf, /api/unlock-pdf |
 | March 24, 2026 | Phase 1.5 bug fixes: rotation round-trip, compact organize thumbnails, auto-scroll during drag, multi-page group drag |
 | March 24, 2026 | Phase 1.5 — Page Management: delete, rotate, reorder, extract, merge; MergeModal, ConfirmDialog; backend extract-pages + merge-pdf endpoints |
 | March 23, 2026 | Phase 1.3 polish: draw gaps, date stamp, font previews, signature size, textbox toolbar fix, font dropdown with previews |
