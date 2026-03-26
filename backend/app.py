@@ -205,29 +205,34 @@ def upload_pdf():
     Save it with a unique name and return the filename so the
     frontend can request it back for viewing.
     """
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file was sent. Please choose a PDF file.'}), 400
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file was sent. Please choose a PDF file.'}), 400
 
-    file = request.files['file']
+        file = request.files['file']
 
-    if file.filename == '':
-        return jsonify({'error': 'No file was selected. Please choose a PDF file.'}), 400
+        if file.filename == '':
+            return jsonify({'error': 'No file was selected. Please choose a PDF file.'}), 400
 
-    if not allowed_file(file.filename):
-        return jsonify({'error': 'That file type is not supported. Please choose a PDF file.'}), 400
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'That file type is not supported. Please choose a PDF file.'}), 400
 
-    unique_id = str(uuid.uuid4())
-    safe_name = secure_filename(file.filename)
-    stored_filename = f"{unique_id}_{safe_name}"
+        unique_id = str(uuid.uuid4())
+        safe_name = secure_filename(file.filename)
+        stored_filename = f"{unique_id}_{safe_name}"
 
-    save_path = os.path.join(UPLOAD_FOLDER, stored_filename)
-    file.save(save_path)
+        save_path = os.path.join(UPLOAD_FOLDER, stored_filename)
+        file.save(save_path)
 
-    return jsonify({
-        'success': True,
-        'filename': stored_filename,
-        'original_name': safe_name
-    })
+        return jsonify({
+            'success': True,
+            'filename': stored_filename,
+            'original_name': safe_name
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
 
 @app.route('/api/pdf/<filename>')

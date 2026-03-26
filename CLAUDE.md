@@ -2,7 +2,7 @@
 
 > This file is read by Claude at the start of every session.
 > Keep it updated. It is the project's memory.
-> Last updated: March 25, 2026
+> Last updated: March 26, 2026 (end of day)
 
 ---
 
@@ -76,10 +76,13 @@ kindpdf/
 │   ├── uploads/           # Temporary PDF storage (not on GitHub)
 │   ├── venv/              # Python virtual environment (not on GitHub)
 │   ├── app.py             # Flask server — main backend entry point
+│   ├── Dockerfile         # Python 3.11 slim + Gunicorn container
 │   └── requirements.txt   # Python dependencies
 ├── frontend/
 │   ├── node_modules/      # React dependencies (not on GitHub)
 │   ├── public/            # Static files
+│   ├── Dockerfile         # Node 20 build stage → nginx:alpine serve stage
+│   ├── nginx.conf         # nginx config: /api/ proxy to backend, .mjs MIME type, 50MB upload limit
 │   └── src/
 │       ├── App.js         # React root — controls which screen is shown
 │       ├── index.js       # React entry point
@@ -124,7 +127,7 @@ kindpdf/
 
 **Phase 1.6 complete:** ✅ Yes
 
-**Phase 1.7 complete:** ☐ No
+**Phase 1.7 complete:** ✅ Yes
 
 **Phase 2 complete:** ☐ No
 
@@ -201,8 +204,15 @@ kindpdf/
 - ✅ Password protection (Phase 1.6) — "Lock PDF" button opens modal with two tabs: Add Password and Remove Password; uses PyMuPDF encryption
 - ✅ Password-protected PDFs prompt for password on open instead of showing "damaged file" error; wrong-password feedback shown in plain English
 - ✅ PDF push-buttons (Print, Submit, etc.) visible in main view via ButtonOverlay — suppressed by annotationMode:0 but recreated as HTML buttons
-- ✅ PDF push-button: Print action calls window.print() directly
+- ✅ PDF push-button: Print action triggers blob-URL iframe print (only the PDF document prints, not the KindPDF UI)
 - ✅ PDF push-button: Submit/email/script/URI/unknown actions show a plain-English dialog — says the feature is not yet supported in KindPDF and offers a practical workaround (e.g. save and email the PDF manually)
+- ✅ Print button in main toolbar — printer icon + "Print" label; uses blob-URL iframe so only the PDF prints; tooltip "Print this PDF."
+- ✅ Ctrl+P intercepted at window level — triggers KindPDF's print function instead of Chrome's print-page dialog
+- ✅ Docker deployment (Phase 1.7) — backend/Dockerfile (Python 3.11 slim + Gunicorn), frontend/Dockerfile (Node 20 build + nginx:alpine), docker-compose.yml (backend + frontend + PostgreSQL), README.md with plain-English self-hosting instructions
+- ✅ Docker: nginx proxies all /api/ requests to Flask backend container; all React fetch calls use relative paths (no hardcoded localhost:5000)
+- ✅ Docker: .mjs files served with correct MIME type (application/javascript) via inline types block in nginx location — required for PDF.js worker
+- ✅ Docker: 50MB upload limit set in nginx (client_max_body_size 50m) so large PDFs are not rejected before Flask sees them
+- ✅ Horizontal scroll at high zoom — zoomed documents can be scrolled left all the way; left side no longer cut off (min-w-max on page container)
 
 ---
 
@@ -210,7 +220,6 @@ kindpdf/
 
 - ☐ Signature round-trip not yet built — saved signatures are embedded as flat images and will not reload as editable overlays on re-open (signatures are rarely edited after placement; acceptable for Phase 1.3)
 - ☐ Annotation coordinates for rotated pages: annotations placed BEFORE rotation may visually shift. Annotations placed AFTER rotation work correctly.
-- ☐ Docker not yet set up (Phase 1.7)
 
 ---
 
@@ -275,119 +284,66 @@ for textboxes created elsewhere.
 
 ## Last Session Summary
 
-**Date:** March 25, 2026 (Phase 1.4 extension — PDF push-button overlay)
+**Date:** March 26, 2026 (Phase 1.7 complete — Docker, Print, polish)
 
-**What we did:** Added PDF push-button support (the buttons that appear in PDFs like Print and Submit Order). These were previously invisible in the main view because KindPDF uses `annotationMode: 0` when rendering pages. We added a `ButtonOverlay.js` component that renders HTML buttons at the correct positions, and extended the backend `/api/form-fields` endpoint to also return button definitions.
+**What we did:** Completed Phase 1.7. Cleaned up all Adobe/Acrobat user-facing references, added a working Print button, fixed Docker networking, fixed the PDF print function (it was printing the KindPDF UI instead of the document), added Ctrl+P interception, and fixed a horizontal scroll bug at high zoom levels.
 
-**Phase 1.4 extension — PDF push-button overlay:**
-- `ButtonOverlay.js` (new component) — per-page HTML buttons positioned over the canvas using the same normalised 0–1 rect → pixel system as FormOverlay. Renders a grey gradient button matching a basic PDF button appearance.
-- Backend `get_form_fields`: now iterates Button widgets instead of skipping them. Reads the label from MK/CA dict entry. Reads action type from the /A action dict: Named→`print`/`named`, SubmitForm→`submit` (with mailto target), JavaScript→`javascript`, URI→`uri`, else→`unknown`. Follows indirect xref references for /A dicts.
-- `/api/form-fields` now returns `{ fields: [...], buttons: [...] }` instead of a plain array. Frontend handles both shapes for backward compatibility.
-- `PDFViewer.js` additions: `pdfButtons` state, `buttonModal` state, `handleButtonClick` callback. Print action calls `window.print()` directly. All other actions open a plain-English modal dialog explaining what the button would do and what to do instead (consistent with the philosophy of being honest about PDF features KindPDF can't support).
-- Button action modal: different content per action type — Submit shows the email address and says "This feature is not yet supported in KindPDF" with workaround (save PDF and email it manually); JavaScript says feature not yet supported; URI opens the link in a new tab; unknown says feature not yet supported. **No mention of Adobe or any third-party product anywhere in user-facing text.**
+**Pre-1.7 cleanup:**
+- Removed all Adobe/Acrobat references from user-facing text in `PDFViewer.js` (button action modals, XFA banner). Replaced with "This feature is not yet supported in KindPDF" and plain-English workarounds.
+- Added Print button to `Toolbar.js` (printer SVG icon + "Print" label, `onPrint` prop, tooltip).
 
-**Phase 1.6 — Password Protection:**
-- `POST /api/protect-pdf` — accepts `{filename, password}`, encrypts with PyMuPDF `doc.save(..., encryption=fitz.PDF_ENCRYPT_AES_256)`, returns new PDF as download
-- `POST /api/unlock-pdf` — accepts `{filename, password}`, opens locked PDF, saves without encryption, returns new PDF
-- `PasswordModal.js` — two-tab modal ("Add a Password" / "Remove Password"), plain English labels, success/error messages
-- Bug fix: password-protected PDFs were showing "damaged file" error. Fixed by adding `loadingTask.onPassword = (updatePassword, reason)` in `PDFViewer.js` to intercept the password exception and show a friendly inline prompt with wrong-password feedback
+**Phase 1.7 — Docker deployment (4 new files):**
+- `backend/Dockerfile` — Python 3.11 slim base; handles UTF-16 encoded requirements.txt (Windows pip saves it that way); installs gunicorn; creates /app/uploads; runs `gunicorn --bind 0.0.0.0:5000 --workers 4 --timeout 120 app:app`
+- `frontend/Dockerfile` — Two-stage: Node 20-slim compiles React (`DISABLE_ESLINT_PLUGIN=true npm run build`); nginx:1.27-alpine serves the build; copies nginx.conf
+- `frontend/nginx.conf` — Serves React app as static files; proxies all `/api/` requests to `http://backend:5000/api/` (Docker internal DNS); adds `.mjs → application/javascript` MIME type inline in location block (required for PDF.js worker); sets `client_max_body_size 50m` (required for large PDF uploads); security headers
+- `docker-compose.yml` — Three services: `backend` (port 5000), `frontend` (port 3000→80), `db` (PostgreSQL 16-alpine, port 5432); named volumes `pdf_uploads` and `db_data`; shared `kindpdf-net` network; db healthcheck; `backend` depends on `db`
 
-**Editable Zoom input:**
-- Toolbar.js zoom percentage display changed from read-only `<span>` to editable `<input type="number">` (10–400 range)
-- Validates and applies on Enter or blur; reverts to current scale on invalid input; Escape cancels edit
-- `onZoomTo` prop added to Toolbar and wired to `setScale` in PDFViewer
+**Docker debugging (4 rounds of fixes):**
+1. **PDF upload failing** — nginx had no `/api/` proxy block AND React source had 11 hardcoded `http://localhost:5000` URLs. Fixed both: created nginx.conf with proxy_pass; replaced all 11 localhost URLs with relative `/api/...` paths across `PDFViewer.js`, `App.js`, `HomeScreen.js`, `PasswordModal.js`, `MergeModal.js`.
+2. **Backend 180-byte error on upload** — Flask upload route had no error handling; also `RUN mkdir -p uploads` was relative (wrong dir). Fixed: wrapped upload route in try/except with traceback; changed to `RUN mkdir -p /app/uploads`.
+3. **nginx crash: "unexpected { in mime.types"** — First attempt placed `types { include /etc/nginx/mime.types; application/javascript mjs; }` at server level — `include` is invalid inside a server-level types block. Fixed: placed `types { application/javascript mjs; }` inline inside the static assets `location` block only.
+4. **All API calls working** — after all relative URL replacements confirmed Docker stack fully functional.
 
-**Phase 1.4 — Form Filling:**
-- `GET /api/form-fields/<filename>` — scans PDF for AcroForm widgets; detects XFA forms via xref scan (checking for `/XFA` string); returns `{xfa: true}` for XFA PDFs, or JSON array of field objects with: page (0-based), name, type (text/checkbox/radio/dropdown/listbox), rect (normalized 0–1 fractions), value, readonly, exportValue (radio), options (dropdown/listbox)
-- `POST /api/save-form` — accepts `{filename, fields:[{name,value}]}`; coerces types per widget kind; calls `widget.update()`; tries `doc.bake()` to flatten; returns new PDF as download
-- `FormOverlay.js` (new component) — per-page HTML overlay for interactive form fields; coordinate conversion: `fraction × pageDimPts × scale`; text inputs with blue tint at rest / white on focus; checkboxes, radio groups, dropdowns
-- `PDFViewer.js` additions: `formFields`, `formValues`, `fillFormMode`, `xfaBanner`, `isSavingForm`, `pageDimensions` state; page-dims fetched on load via `getViewport({scale:1,rotation:0})`; form fields fetched after dims; `handleSaveFilledForm` callback; XFA amber banner; `<FormOverlay>` inside page render loop
-- `Toolbar.js` additions: "Fill In Form" button (icon + text, blue when active, hidden when no form fields); "Save Filled Form" green button with spinner (shown only in fill mode)
+**Print fix — blob URL iframe approach:**
+- Original `window.print()` / `iframe.src = activePdfUrl` approach was printing the KindPDF React UI (not the PDF) because the relative URL loaded the React app in the iframe.
+- Fixed with blob URL approach: `fetch(activePdfUrl)` → `blob()` → `URL.createObjectURL(blob)` → iframe src. Chrome's PDF plugin renders the blob and prints only the document. Fallback: opens PDF in new tab if fetch fails.
+- `handlePrint` is a `useCallback` in `PDFViewer.js` with `[activePdfUrl]` dep array.
+- `handleButtonClick` (PDF push-button handler) updated to call `handlePrint()` for print action type; dep array updated to `[handlePrint]` to avoid stale closure.
+- `onPrint={handlePrint}` passed to `<Toolbar>`.
+
+**Ctrl+P interception:**
+- `useEffect` added in `PDFViewer.js` (AFTER the `handlePrint` declaration to avoid temporal dead zone) that listens for `keydown` on `window`; if `Ctrl+P` or `Cmd+P` is detected, calls `e.preventDefault()` then `handlePrint()`. Cleaned up on unmount. Dep array: `[handlePrint]`.
+
+**Horizontal scroll fix at high zoom:**
+- When zoomed in on a wide document, pages were wider than the viewport; `items-center` on the flex column was centering them at x=0 but the overflow went left (negative x, unreachable by scroll).
+- Fixed by adding `min-w-max` to the inner page container div — forces the container to expand to at least the width of its widest child, making the full width scrollable.
 
 **Key technical notes:**
-- XFA detection: brute-force scan all xref objects for `/XFA` string — direct object-tree navigation fails for compressed/indirect refs
-- Normalized rects (0–1 fractions of page dimensions) ensure field positions survive zoom changes
-- `doc.bake()` (PyMuPDF ≥ 1.22) flattens fields to permanent content; gracefully falls back on older versions
-
-**Architecture — staged page changes:**
-- `pageHistory` state in `PDFViewer.js` uses the same past/present/future undo pattern
-  as `annotationHistory`. `present = { pageOrder: [1,2,...N], pageRotations: {origPageNum: degrees} }`.
-- `pageOrder` drives the main render loop (replacing `Array.from({length: numPages})`).
-- All page operations are staged in frontend state until Save As PDF.
-- At save time, `pageOrder` and `pageRotations` are sent to the backend alongside annotations.
-
-**Backend changes (`app.py`):**
-- `POST /api/save-annotations` updated: accepts `pageOrder` (array of 1-based orig page nums
-  in new order) and `pageRotations` (`{origPageNum: degrees}`). Uses `doc.select()` to
-  reorder/delete, `page.set_rotation()` for rotation, and remaps annotation page numbers
-  from original → new positions using `orig_to_new_idx` dict.
-- `POST /api/extract-pages` — `{filename, pageNums}` → extracts subset of pages via
-  `doc.select()`, returns new PDF as download.
-- `POST /api/merge-pdf` — `{baseFilename, mergeFilename, insertAfterPage}` → merges second
-  PDF at specified position using `base_doc.insert_pdf()`, saves to new temp file, returns
-  `{success, filename, numPages}`.
-
-**New frontend components:**
-- `ConfirmDialog.js` — reusable confirmation modal (icon + title + message + Cancel + Confirm).
-- `MergeModal.js` — 2-step merge wizard: Step 1 choose file (uploads to backend), Step 2
-  pick insertion position (dropdown). After merge, viewer reloads with merged file.
-
-**Updated components:**
-- `Sidebar.js` — full rewrite:
-  - "Organize Pages" toggle button in header switches to management mode
-  - Compact management layout: two-column horizontal cards (~90px tall), thumbnail left + controls right
-  - Thumbnails cached by `origPageNum-additionalRot` key; cache cleared when pdfDoc changes
-  - Rotation rendering: `totalRot = (page.rotate + additionalRot) % 360` — respects PDF intrinsic rotation
-  - Drag-and-drop reorder via HTML5 drag API (no external library)
-  - Auto-scroll via `requestAnimationFrame` when cursor within 80px of sidebar top/bottom edge
-  - `handleDrop` passes `selectedPages` as third arg to `onReorderPages` for group moves
-  - Per-thumbnail: "↺ Left", "↻ Right" (rotate), 🗑️ (delete with inline confirm) buttons
-  - Selection checkboxes for extract; "Save N Pages as New File" button when selected
-  - Page undo/redo buttons visible in management mode
-  - "Insert Another PDF" merge button
-  - Footer shows total page count
-- `PDFViewer.js`:
-  - `activePdfUrl` / `activePdfFilename` internal state (starts from props; merge updates them)
-  - `pageHistory` with past/present/future undo stack
-  - `pageOrder` drives render loop; `pageRotations` passed to `renderPage()`
-  - `renderPage()` rotation fix: `totalRotation = (page.rotate + additionalRotation) % 360` passed to `getViewport`
-  - `handleReorderPages` supports group moves: when dragged page is in selectedPages (size > 1), all selected move together
-  - Page management handlers: `handleDeletePage`, `handleRotatePage`, `handleReorderPages`,
-    `handleSelectPage`, `handleExtractPages`, `handleMergeComplete`, `handlePageUndo`, `handlePageRedo`
-  - Toolbar shows display position (pageOrder.indexOf(currentPage)+1) not original page number
-  - Page management mode banner (amber) shown when managing pages
-  - `MergeModal` rendered at bottom of component tree
-
-**Bug fixes applied:**
-1. **Rotation not round-trip** — PDF.js `getViewport({ rotation: 0 })` was overriding the PDF's baked-in rotation. Fixed by computing `totalRotation = (page.rotate + additionalRotation) % 360` in both `renderPage` (PDFViewer.js) and thumbnail rendering (Sidebar.js).
-2. **Thumbnails too large in organize mode** — Redesigned management cards to horizontal two-column layout (~90px vs ~240px before); more pages visible, easier to drag.
-3. **No auto-scroll + no group drag** — Added `requestAnimationFrame` auto-scroll on sidebar `onDragOver`; updated `handleDrop` to pass `selectedPages` and `handleReorderPages` to move entire selection as a group.
-
-**Known limitation:**
-- Annotation coordinates for rotated pages: annotations placed BEFORE rotation may visually shift. Annotations placed AFTER rotation work correctly.
+- `const` declarations are not hoisted (temporal dead zone) — a `useEffect` that references a `useCallback` must appear AFTER the `useCallback` declaration in the file, or React will throw "Cannot access before initialization".
+- Stale closure risk: `useCallback(..., [])` with an empty dep array captures the initial value of any called functions. If `handleButtonClick` calls `handlePrint`, `handlePrint` must be in the dep array.
+- Docker internal DNS resolves service names (e.g. `backend`) to container IPs automatically — no IP addresses or environment variables needed in nginx.conf.
+- `.mjs` MIME type must be set inside a specific `location` block, not at server level, when combined with `include mime.types` — nginx syntax restriction.
 
 ---
 
 ## Next Session Goal
 
-**Before starting Phase 1.7, do these two clean-up tasks first:**
+**Phase 1 is fully complete. All MVP features and Docker deployment are done.**
 
-1. **Remove all Adobe/Acrobat references from button action dialogs** in
-   `PDFViewer.js` (the `handleButtonClick` modal JSX). Replace every
-   "open in Adobe Acrobat Reader" instruction with "This feature is not yet
-   supported in KindPDF." and a practical workaround where one exists. No
-   third-party product names in any user-facing message.
+**Suggested first task for Phase 2: PWA support**
 
-2. **Add a Print button to the KindPDF toolbar** (`Toolbar.js`) so users
-   can print the current PDF without needing an embedded Print push-button
-   in the PDF itself. The button should call `window.print()`. Icon + text
-   label required (design rule #1). Tooltip: "Print this PDF."
+Adding PWA (Progressive Web App) support is a high-impact, low-effort win that makes the app feel like a native desktop application. It is a good first step before adding accounts or cloud features because it requires no backend changes.
 
-**Then proceed to Phase 1.7 — Docker deployment:**
-- Write Dockerfile for backend (Python/Flask)
-- Write Dockerfile for frontend (React build → nginx)
-- Write docker-compose.yml (backend + frontend + PostgreSQL)
-- Add README setup instructions for self-hosting
+What to build:
+- `frontend/public/manifest.json` — app name, icon paths, theme color, `display: "standalone"`
+- Service worker registration in `index.js` — cache static assets for offline use
+- Add icon files (192×192 and 512×512 PNG, KindPDF "K" logo on blue)
+- Meta tags in `index.html` for iOS home screen support
+
+After PWA, the likely Phase 2 order is:
+1. User accounts — PostgreSQL integration, Flask-Login, registration/login screens
+2. File storage tied to accounts — saved PDFs associated with a user; "My Files" dashboard
+3. Hosted cloud deployment — deploy to a VPS or cloud provider with a real domain name
 
 ---
 
@@ -395,6 +351,7 @@ for textboxes created elsewhere.
 
 | Date | What Was Accomplished |
 |---|---|
+| March 26, 2026 | Phase 1.7 complete: Docker (backend/Dockerfile, frontend/Dockerfile, nginx.conf, docker-compose.yml, README.md); nginx /api/ proxy + .mjs MIME type + 50MB upload limit; all 11 localhost:5000 URLs replaced with relative paths; Adobe/Acrobat text purged from UI; Print button (blob iframe — prints PDF not UI); Ctrl+P interception; horizontal scroll fix at high zoom (min-w-max) |
 | March 25, 2026 | Phase 1.4 extension: PDF push-button overlay (ButtonOverlay.js, handleButtonClick, honest action modal); backend /api/form-fields extended to return buttons array |
 | March 25, 2026 | Phase 1.4 (Form Filling) + Phase 1.6 (Password Protection) + editable zoom input; FormOverlay.js, PasswordModal.js, backend /api/form-fields, /api/save-form, /api/protect-pdf, /api/unlock-pdf |
 | March 24, 2026 | Phase 1.5 bug fixes: rotation round-trip, compact organize thumbnails, auto-scroll during drag, multi-page group drag |
@@ -432,6 +389,10 @@ for textboxes created elsewhere.
 | Ctrl+F intercepted at window level | PDF text is on canvas — Chrome's built-in search can't find it anyway |
 | Sticky notes saved as native PDF annotations | Enables real interactivity in Acrobat/Preview; flat drawn boxes were dead graphics |
 | Highlight merge at save time only | Frontend keeps individual objects for undo granularity; merge only when writing to PDF |
+| Blob URL iframe for Print | `window.print()` and `iframe.src = relativeUrl` both printed the React UI. Fetching the PDF as a blob and using `URL.createObjectURL` guarantees Chrome's PDF plugin renders it inside the iframe |
+| Ctrl+P intercepted at window level | Mirrors Ctrl+F approach — Chrome's native Ctrl+P prints the page, not the PDF |
+| All API calls use relative paths | Hardcoded localhost:5000 breaks Docker (no host networking). Relative `/api/...` paths work in both dev (CRA proxy) and Docker (nginx proxy) |
+| nginx .mjs MIME type inline in location block | nginx rejects `include` inside a server-level `types {}` block. Must be placed inside the specific `location` block that serves the file |
 
 ---
 

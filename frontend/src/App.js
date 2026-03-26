@@ -19,7 +19,7 @@ function App() {
   // filename = the unique name the backend assigned
   // originalName = the human-readable filename (e.g. "my-contract.pdf")
   const handlePdfLoaded = (filename, originalName) => {
-    setPdfFile(`http://localhost:5000/api/pdf/${filename}`);
+    setPdfFile(`/api/pdf/${filename}`);
     setPdfName(originalName);
     setPdfFilename(filename);
   };

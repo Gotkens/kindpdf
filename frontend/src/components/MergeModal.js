@@ -54,7 +54,7 @@ function MergeModal({ isOpen, currentNumPages, currentFilename, onClose, onMerge
       const formData = new FormData();
       formData.append('file', file);
 
-      const res = await fetch('http://localhost:5000/api/upload', {
+      const res = await fetch('/api/upload', {
         method: 'POST',
         body: formData,
       });
@@ -65,7 +65,7 @@ function MergeModal({ isOpen, currentNumPages, currentFilename, onClose, onMerge
 
       // Count pages by loading the PDF briefly with PDF.js
       // We use a quick fetch + getDocument to get numPages
-      const pdfUrl = `http://localhost:5000/api/pdf/${encodeURIComponent(data.filename)}`;
+      const pdfUrl = `/api/pdf/${encodeURIComponent(data.filename)}`;
       const { getDocument } = await import('pdfjs-dist');
       const pdfTask = getDocument(pdfUrl);
       const pdfDoc  = await pdfTask.promise;
@@ -93,7 +93,7 @@ function MergeModal({ isOpen, currentNumPages, currentFilename, onClose, onMerge
     setIsMerging(true);
 
     try {
-      const res = await fetch('http://localhost:5000/api/merge-pdf', {
+      const res = await fetch('/api/merge-pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

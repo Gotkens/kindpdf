@@ -16,7 +16,8 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 
-const API_BASE = 'http://localhost:5000';
+// Empty string = relative URL — nginx proxies /api/* to the backend container.
+const API_BASE = '';
 
 // ── Icon helpers (inline SVG, no external dependency) ─────────────────────────
 

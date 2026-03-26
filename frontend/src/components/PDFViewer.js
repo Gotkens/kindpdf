@@ -641,7 +641,7 @@ const [openStickyId, setOpenStickyId] = useState(null);
         if (activePdfFilename) {
           try {
             const res = await fetch(
-              `http://localhost:5000/api/annotations/${encodeURIComponent(activePdfFilename)}`
+              `/api/annotations/${encodeURIComponent(activePdfFilename)}`
             );
             if (cancelled) return;
             if (res.ok) {
@@ -684,7 +684,7 @@ const [openStickyId, setOpenStickyId] = useState(null);
         if (activePdfFilename && !cancelled) {
           try {
             const formRes = await fetch(
-              `http://localhost:5000/api/form-fields/${encodeURIComponent(activePdfFilename)}`
+              `/api/form-fields/${encodeURIComponent(activePdfFilename)}`
             );
             if (!cancelled && formRes.ok) {
               const formData = await formRes.json();
@@ -919,7 +919,6 @@ const [openStickyId, setOpenStickyId] = useState(null);
     window.addEventListener('keydown', handleCtrlF);
     return () => window.removeEventListener('keydown', handleCtrlF);
   }, []);
-
 
   // ============================================================
   // ZOOM
@@ -1226,7 +1225,7 @@ const [openStickyId, setOpenStickyId] = useState(null);
     if (selectedPages.size === 0 || !activePdfFilename) return;
 
     try {
-      const res = await fetch('http://localhost:5000/api/extract-pages', {
+      const res = await fetch('/api/extract-pages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1259,7 +1258,7 @@ const [openStickyId, setOpenStickyId] = useState(null);
   }, [selectedPages, activePdfFilename]);
 
   const handleMergeComplete = useCallback((newFilename, newNumPages) => {
-    const newUrl = `http://localhost:5000/api/pdf/${encodeURIComponent(newFilename)}`;
+    const newUrl = `/api/pdf/${encodeURIComponent(newFilename)}`;
     // Updating activePdfUrl triggers the pdfDoc load useEffect, which resets
     // pageOrder, pageRotations, annotations, and all viewer state cleanly.
     setActivePdfUrl(newUrl);
@@ -1843,17 +1842,72 @@ else if (activeTool === 'sticky') {
   // actions KindPDF can perform natively (print) and show an honest,
   // plain-English dialog for everything else rather than silently failing.
 
+  // Print the raw PDF in a hidden iframe so only the document itself goes to
+  // the printer — not the KindPDF toolbar, annotations canvas, or Chrome UI.
+  //
+  // WHY blob: URL instead of setting iframe.src = activePdfUrl directly:
+  //   Setting a relative /api/pdf/... path as the iframe src can cause Chrome
+  //   to render it as HTML (React app) rather than invoking its PDF plugin,
+  //   because the Content-Type from the iframe request may not be explicit
+  //   enough for Chrome to route it to the PDF renderer.  Fetching first and
+  //   converting to a blob: URL guarantees the iframe receives typed binary
+  //   PDF data — Chrome always opens blob: PDFs with its native PDF viewer.
+  const handlePrint = useCallback(async () => {
+    try {
+      const response = await fetch(activePdfUrl);
+      if (!response.ok) throw new Error('Could not fetch PDF for printing.');
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+
+      const iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.src = blobUrl;
+      document.body.appendChild(iframe);
+
+      iframe.onload = () => {
+        setTimeout(() => {
+          iframe.contentWindow.print();
+          setTimeout(() => {
+            document.body.removeChild(iframe);
+            URL.revokeObjectURL(blobUrl);   // free memory
+          }, 1000);
+        }, 500);
+      };
+    } catch (err) {
+      // Fallback: open the PDF in a new tab where the user can print manually.
+      window.open(activePdfUrl, '_blank', 'noopener,noreferrer');
+    }
+  }, [activePdfUrl]);
+
+  // handlePrint is listed as a dependency so the embedded Print button always
+  // calls the current version of handlePrint (i.e. with the latest activePdfUrl).
   const handleButtonClick = useCallback((btn) => {
     if (btn.action_type === 'print') {
-      // window.print() triggers the browser's native print dialog which
-      // works well for PDFs rendered inside the page.
-      window.print();
+      // Use the blob-based print so embedded Print buttons also print only
+      // the PDF document, consistent with the toolbar Print button behaviour.
+      handlePrint();
       return;
     }
     // For all other action types, open the informational dialog so the user
     // knows what the button *would* do and what to do instead.
     setButtonModal({ btn });
-  }, []);
+  }, [handlePrint]);
+
+  // Intercept Ctrl+P / Cmd+P so it prints only the PDF document (via the
+  // blob-iframe method) instead of Chrome's default "print the whole page".
+  // Placed here — after handlePrint is declared — to avoid the temporal dead
+  // zone error that occurs when a useEffect dependency array references a
+  // const that hasn't been initialised yet.
+  useEffect(() => {
+    const handleCtrlP = e => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'p') {
+        e.preventDefault();
+        handlePrint();
+      }
+    };
+    window.addEventListener('keydown', handleCtrlP);
+    return () => window.removeEventListener('keydown', handleCtrlP);
+  }, [handlePrint]);
 
 
   // ============================================================
@@ -1870,7 +1924,7 @@ else if (activeTool === 'sticky') {
     try {
       // Include pageOrder and pageRotations so the backend can apply page operations
       // (reorder, delete, rotate) before embedding annotations.
-      const response = await fetch('http://localhost:5000/api/save-annotations', {
+      const response = await fetch('/api/save-annotations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1996,6 +2050,7 @@ else if (activeTool === 'sticky') {
         onZoomTo={v => setScale(Math.min(Math.max(v, 0.1), 4.0))}
         onToggleSidebar={() => setSidebarOpen(o => !o)} onClose={onClose} pdfName={pdfName}
         onProtectUnlock={() => setPasswordModalOpen(true)}
+        onPrint={handlePrint}
         searchQuery={searchQuery} onSearchChange={setSearchQuery}
         onSearchSubmit={() => allMatches.length > 0 ? handleSearchNext() : runSearch(searchQuery)}
         searchMatchCount={totalMatchCount} searchMatchIndex={searchMatchIndex}
@@ -2064,16 +2119,16 @@ else if (activeTool === 'sticky') {
       )}
 
       {/* ── XFA form warning banner (Phase 1.4) ──────────────────────────────
-          Shown when the opened PDF uses Adobe's XFA format, which KindPDF cannot
-          render interactively. Directs the user to open the file in Acrobat Reader.
+          Shown when the opened PDF uses an XFA form format that KindPDF cannot
+          render interactively.
       ── */}
       {xfaBanner && (
         <div className="bg-amber-50 border-b border-amber-300 px-4 py-2.5 flex items-center justify-between gap-4">
           <div className="flex items-center gap-2.5">
             <span className="text-lg" aria-hidden="true">⚠️</span>
             <span className="text-sm font-medium text-amber-800">
-              This PDF uses a special Adobe format that KindPDF can't fill in yet.
-              Try opening it in <strong>Adobe Acrobat Reader</strong> (free) instead.
+              This PDF uses a form format that KindPDF does not yet support. You can view
+              and print the PDF, but the form fields cannot be filled in KindPDF at this time.
             </span>
           </div>
           <button
@@ -2126,7 +2181,16 @@ else if (activeTool === 'sticky') {
         )}
 
         <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-auto bg-gray-200">
-          <div className="flex flex-col items-center py-6 gap-6">
+          {/*
+            min-w-max is the fix for the "can't scroll to the left when zoomed in" bug.
+            Without it, the inner div's width equals the scroll container's width, and
+            items-center positions wide pages at a negative x offset that is unreachable
+            (scrollLeft cannot go below 0). min-w-max expands the inner div to at least
+            the widest page's pixel width, so scrollLeft=0 lands at the LEFT edge of the
+            page and the full document width is scrollable. When pages are narrower than
+            the viewport, min-w-max has no effect and items-center centres them normally.
+          */}
+          <div className="flex flex-col items-center py-6 gap-6 min-w-max">
             {/* Render pages in pageOrder order. Each pageNum here is the original
                 1-based page number from the PDF — unchanged by reordering/deletion,
                 so all canvas IDs, annotation lookups, and refs remain stable. */}
@@ -2330,13 +2394,13 @@ else if (activeTool === 'sticky') {
           const email  = mailto.replace(/^mailto:/i, '');
           message = (
             <>
-              In Adobe Acrobat, clicking <strong>{btn.label || 'this button'}</strong> would
-              email the filled form to <strong>{email || 'the address in the PDF'}</strong>.
+              Clicking <strong>{btn.label || 'this button'}</strong> would send the filled
+              form to <strong>{email || 'the address in the PDF'}</strong> by email.
             </>
           );
           instruction = (
             <>
-              KindPDF can't send email automatically.{' '}
+              This feature is not yet supported in KindPDF.{' '}
               <strong>Save your filled PDF</strong> using the{' '}
               <em>Save As PDF</em> button, then attach it to an email yourself.
             </>
@@ -2352,8 +2416,8 @@ else if (activeTool === 'sticky') {
           );
           instruction = (
             <>
-              KindPDF doesn't run embedded PDF scripts. To use this button,{' '}
-              open the PDF in <strong>Adobe Acrobat Reader</strong> (free download).
+              This feature is not yet supported in KindPDF. Save your filled PDF using the{' '}
+              <em>Save As PDF</em> button and use the script through another means if needed.
             </>
           );
         } else if (btn.action_type === 'uri') {
@@ -2388,8 +2452,8 @@ else if (activeTool === 'sticky') {
           );
           instruction = (
             <>
-              KindPDF doesn't support this action. To use it, open the PDF in{' '}
-              <strong>Adobe Acrobat Reader</strong> (free download).
+              This feature is not yet supported in KindPDF. Save your PDF using the{' '}
+              <em>Save As PDF</em> button to use it elsewhere.
             </>
           );
         } else {
@@ -2403,8 +2467,8 @@ else if (activeTool === 'sticky') {
           );
           instruction = (
             <>
-              To use it, open the PDF in <strong>Adobe Acrobat Reader</strong>{' '}
-              (free download from adobe.com).
+              This feature is not yet supported in KindPDF. Save your PDF using the{' '}
+              <em>Save As PDF</em> button to use it elsewhere.
             </>
           );
         }

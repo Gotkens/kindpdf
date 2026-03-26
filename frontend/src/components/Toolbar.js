@@ -20,6 +20,7 @@ function Toolbar({
   onToggleSidebar,   // Callback: show/hide thumbnail sidebar
   pdfName,           // Filename to display in the toolbar
   onProtectUnlock,   // Callback: open the Password Settings modal (Phase 1.6)
+  onPrint,           // Callback: print the PDF via hidden iframe (Phase 1.7)
   // Search props
   searchQuery,         // Current search text
   onSearchChange,      // Callback: user typed in search box
@@ -303,6 +304,24 @@ function Toolbar({
             d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
         </svg>
         <span className="hidden sm:inline">Lock PDF</span>
+      </button>
+
+      {/* Divider */}
+      <div className="w-px h-8 bg-gray-200 mx-1 hidden sm:block" aria-hidden="true" />
+
+      {/* ── Print (Phase 1.7) ── */}
+      <button
+        onClick={onPrint}
+        title="Print this PDF."
+        aria-label="Print this PDF"
+        className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-gray-700 hover:bg-gray-100 transition-colors text-sm font-medium"
+      >
+        {/* Printer icon */}
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+            d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" />
+        </svg>
+        <span className="hidden sm:inline">Print</span>
       </button>
 
     </div>
