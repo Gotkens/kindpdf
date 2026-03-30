@@ -492,6 +492,10 @@ export default function PDFViewer({ pdfUrl, pdfName, pdfFilename, onClose }) {
   const [eraserSize, setEraserSize] = useState(20);
   const [isSaving, setIsSaving] = useState(false);
 
+  // Pan (grab-and-drag) state — true while the user is actively dragging the document.
+  // Stored in state (not just a ref) so getCursor() re-renders to 'grabbing'.
+  const [isPanning, setIsPanning] = useState(false);
+
   // Text box font settings
   const [textFontFamily, setTextFontFamily] = useState('Arial');
   const [textFontSize, setTextFontSize] = useState(14);
@@ -935,6 +939,42 @@ const [openStickyId, setOpenStickyId] = useState(null);
   const zoomOut = () => setScale(s => Math.max(s - 0.2, 0.3));
 
   useEffect(() => { if (pdfDoc) fitToScreen(); }, [pdfDoc, fitToScreen]);
+
+  // ── Pan (grab-and-drag) ─────────────────────────────────────────────────────
+  // When no annotation tool is active the cursor becomes an open hand. Clicking
+  // and dragging scrolls the document in both axes. Global mousemove/mouseup
+  // listeners are registered on mousedown and removed on mouseup so that
+  // dragging outside the scroll container (moving the mouse quickly) keeps
+  // working correctly. The closure captures the start coords directly, so no
+  // extra refs are needed.
+  const handlePanMouseDown = useCallback((e) => {
+    if (activeTool) return;     // annotation tool active — don't intercept
+    if (e.button !== 0) return; // left button only; allow right-click context menus
+    e.preventDefault();         // prevent accidental text selection while dragging
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startScrollLeft = scrollContainerRef.current.scrollLeft;
+    const startScrollTop  = scrollContainerRef.current.scrollTop;
+
+    setIsPanning(true);
+
+    const onMove = (ev) => {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      scrollContainerRef.current.scrollLeft = startScrollLeft - dx;
+      scrollContainerRef.current.scrollTop  = startScrollTop  - dy;
+    };
+
+    const onUp = () => {
+      setIsPanning(false);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup',   onUp);
+    };
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup',   onUp);
+  }, [activeTool]); // re-created when activeTool changes; scrollContainerRef is stable
 
 
   // ============================================================
@@ -1909,6 +1949,34 @@ else if (activeTool === 'sticky') {
     return () => window.removeEventListener('keydown', handleCtrlP);
   }, [handlePrint]);
 
+  // Intercept Ctrl+Scroll so it zooms the PDF document instead of the browser
+  // window. Attached to scrollContainerRef (not window) so it only fires when
+  // the cursor is over the document area — Ctrl+Scroll over the toolbar or
+  // sidebar still triggers the normal browser zoom behaviour.
+  // { passive: false } is required for preventDefault() to work on wheel events
+  // in Chrome; without it the browser ignores the call and zooms anyway.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const handleCtrlScroll = e => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      // Zoom in on scroll-up (negative deltaY), out on scroll-down.
+      // Multiply/divide by 1.1 (~10% per tick) for smooth, natural feel on
+      // both discrete scroll wheels and trackpads.
+      const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      setScale(s => Math.min(Math.max(s * factor, 0.1), 4.0));
+    };
+    el.addEventListener('wheel', handleCtrlScroll, { passive: false });
+    return () => el.removeEventListener('wheel', handleCtrlScroll);
+  }, [pdfDoc]); // Re-run when pdfDoc is set — the scroll container div only enters
+  // the DOM after the loading spinner is replaced by the main render, so
+  // scrollContainerRef.current is null on the very first effect run ([] would
+  // capture null and never attach the listener). Using [pdfDoc] ensures we
+  // re-run once the PDF has loaded and the container is actually in the DOM.
+  // setScale from useState is guaranteed stable; the functional updater form
+  // (s => ...) means we never read scale directly, so it needs no dep entry.
+
 
   // ============================================================
   // ANNOTATION — SAVE PDF (with native Save As dialog)
@@ -1989,7 +2057,7 @@ else if (activeTool === 'sticky') {
   // ============================================================
 
   const getCursor = () => {
-    if (!activeTool) return 'default';
+    if (!activeTool) return isPanning ? 'grabbing' : 'grab';
     if (activeTool === 'pen') return 'crosshair';
     if (activeTool === 'eraser') return eraserMode === 'fine' ? 'none' : 'cell';
     if (activeTool === 'textbox' || activeTool === 'sticky') return 'text';
@@ -2180,7 +2248,12 @@ else if (activeTool === 'sticky') {
           />
         )}
 
-        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-auto bg-gray-200">
+        <div
+          ref={scrollContainerRef}
+          className="flex-1 overflow-y-auto overflow-x-auto bg-gray-200"
+          style={{ cursor: getCursor() }}
+          onMouseDown={handlePanMouseDown}
+        >
           {/*
             min-w-max is the fix for the "can't scroll to the left when zoomed in" bug.
             Without it, the inner div's width equals the scroll container's width, and

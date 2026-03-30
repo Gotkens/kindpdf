@@ -1,0 +1,26 @@
+# frontend/.dockerignore
+# KindPDF — files to exclude from the Docker build context
+#
+# WHY node_modules IS CRITICAL TO EXCLUDE:
+#   The Dockerfile runs "npm ci" inside the container, which installs clean,
+#   Linux-native dependencies — including platform-specific binaries for tools
+#   like esbuild (used by Tailwind v3 internally via jiti).
+#
+#   Without this file, "COPY . ." sends the host's node_modules (built on
+#   Windows) into the Docker build context and overwrites the Linux-native
+#   modules that npm ci just installed. The Windows esbuild binary does not
+#   run on Linux, so Tailwind cannot scan source files for classes, and the
+#   compiled CSS file contains only ~26KB of browser resets with zero utility
+#   classes. Result: the app renders as completely unstyled HTML.
+#
+#   Excluding node_modules here means "COPY . ." only copies source code.
+#   The container uses its own Linux-native node_modules from npm ci instead.
+#
+# SIDE BENEFIT: Excluding node_modules also makes builds much faster —
+#   node_modules is typically 200–400MB and slow to send to the Docker daemon.
+
+node_modules
+build
+.env
+.env.*
+npm-debug.log*

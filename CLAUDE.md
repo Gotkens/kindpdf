@@ -2,7 +2,7 @@
 
 > This file is read by Claude at the start of every session.
 > Keep it updated. It is the project's memory.
-> Last updated: March 26, 2026 (end of day)
+> Last updated: March 30, 2026 (session 2)
 
 ---
 
@@ -213,10 +213,46 @@ kindpdf/
 - ✅ Docker: .mjs files served with correct MIME type (application/javascript) via inline types block in nginx location — required for PDF.js worker
 - ✅ Docker: 50MB upload limit set in nginx (client_max_body_size 50m) so large PDFs are not rejected before Flask sees them
 - ✅ Horizontal scroll at high zoom — zoomed documents can be scrolled left all the way; left side no longer cut off (min-w-max on page container)
+- ✅ Ctrl+Scroll zoom — zooms the PDF document (not the browser window); attached to the scroll container div with `{ passive: false }` so preventDefault works; clamped to 0.1–4.0; only fires when cursor is over the document area
+- ✅ Pan / grab-and-drag — when no annotation tool is active, cursor is an open hand (grab); click and drag scrolls the document in both axes; cursor changes to grabbing while dragging; global mousemove/mouseup on window so fast drags outside the container don't break tracking; all annotation tools unaffected
 
 ---
 
 ## What Is NOT Working / Known Issues
+
+- ☐ **Docker CSS broken — STILL UNFIXED after multiple attempts (March 30, 2026)**
+
+  **Symptom:** When running via Docker at localhost:3000, all Tailwind CSS styling is missing. The app renders as plain unstyled HTML. Works perfectly in dev mode (`npm start`).
+
+  **Key diagnostic finding:** The compiled CSS file inside the container is only **26.2KB** (`main.cba459b3.css`). A correct Tailwind build for this app should be 200–400KB. This means Tailwind IS running during `npm run build` but is finding almost no classes to include. This is a content scanning failure — Tailwind can't see the source files, or something is preventing it from including the classes it finds.
+
+  **Confirmed NOT the cause (these are all correct and have been verified):**
+  - `frontend/src/index.css` — has all three `@tailwind` directives ✅
+  - `frontend/tailwind.config.js` — content array is `["./src/**/*.{js,jsx,ts,tsx}"]` ✅
+  - `frontend/postcss.config.js` — has tailwindcss and autoprefixer ✅
+  - React app loads and runs correctly in Docker (JS/components work fine) ✅
+
+  **Fixes already applied that did NOT solve it (do not repeat these):**
+  1. **nginx.conf** — split static assets location block so `.mjs` gets its own `types {}` block, preventing it from overriding MIME types for CSS files. This was a real bug but did not fix the styling.
+  2. **package.json** — moved `tailwindcss`, `postcss`, `autoprefixer` from `devDependencies` to `dependencies` so npm never skips them. Did not fix it.
+  3. **Dockerfile** — added `NODE_ENV=development` prefix to `npm ci` to force installation of all packages regardless of environment. Did not fix it.
+  4. **frontend/.dockerignore** — created to prevent Windows `node_modules` (with Windows-native esbuild binaries) from overwriting the Linux-native packages installed by `npm ci`. Did not fix it.
+
+  **Next diagnostic steps to try:**
+  - Check what is actually INSIDE the 26KB CSS file — run `docker exec kindpdf-frontend grep -c "bg-blue" /usr/share/nginx/html/static/css/main.*.css`. If result is 0, Tailwind found no classes at all. If > 0, some classes are there but not all.
+  - Check the full Docker build log carefully for PostCSS or Tailwind warnings during `npm run build`
+  - Try running `npm run build` locally (outside Docker) and check the CSS output size — if it's also 26KB locally, the problem is not Docker-specific but a Tailwind config issue
+  - Investigate whether react-scripts 5.0.1 (released 2022) has a compatibility issue with Tailwind v3 content scanning in production mode specifically
+  - Try adding an explicit `safelist` to tailwind.config.js with a few test classes to confirm whether safelisted classes appear in the output
+  - Consider switching from postcss.config.js approach to using CRACO or the `@craco/craco` package which is specifically designed to extend CRA's build config reliably
+
+  ---
+
+  **New hypothesis (added March 30, 2026):** Before running any of the diagnostic steps above, first verify which problem we actually have. There are two completely different failure modes that look identical to the user:
+  1. Tailwind didn't build the CSS correctly → the CSS file inside the container is ~26KB (nearly empty)
+  2. Tailwind built correctly BUT nginx is serving the CSS file with the wrong content-type header → the browser silently refuses to apply it
+
+  We have been assuming problem #1 without confirming it. The print button fix (Phase 1.7) rewrote nginx.conf. A misconfigured nginx content-type header would explain why Docker worked befor
 
 - ☐ Signature round-trip not yet built — saved signatures are embedded as flat images and will not reload as editable overlays on re-open (signatures are rarely edited after placement; acceptable for Phase 1.3)
 - ☐ Annotation coordinates for rotated pages: annotations placed BEFORE rotation may visually shift. Annotations placed AFTER rotation work correctly.
@@ -284,7 +320,24 @@ for textboxes created elsewhere.
 
 ## Last Session Summary
 
-**Date:** March 26, 2026 (Phase 1.7 complete — Docker, Print, polish)
+**Date:** March 30, 2026 (session 2) — Ctrl+Scroll zoom fix + pan/grab-and-drag
+
+**What we did:**
+
+**Ctrl+Scroll zoom fix:**
+The `useEffect` that attached the wheel listener had `[]` as its dependency array. The effect ran once after the component first mounted — but at that point `isLoading` was `true`, so the component was rendering the spinner (an early return), not the main view that contains the `scrollContainerRef` div. `scrollContainerRef.current` was `null`, the `if (!el) return` guard fired, and no listener was ever attached. Fixed by changing the dep array from `[]` to `[pdfDoc]` so the effect re-runs once the PDF loads and the scroll container is actually in the DOM.
+
+**Pan / grab-and-drag:**
+- Added `isPanning` state (React state, not just a ref, so `getCursor()` re-renders to `'grabbing'`).
+- Updated `getCursor()`: no tool active → `'grab'` (idle) or `'grabbing'` (while dragging).
+- Added `handlePanMouseDown` useCallback: on left-mousedown with no active tool, records start coords in a closure, calls `setIsPanning(true)`, registers global `window` mousemove/mouseup handlers. The move handler updates `scrollLeft`/`scrollTop` on the container. The up handler calls `setIsPanning(false)` and removes both listeners.
+- Added `onMouseDown={handlePanMouseDown}` and `style={{ cursor: getCursor() }}` to the `scrollContainerRef` div so the cursor cascades to all children via CSS inheritance.
+- Global listeners on `window` (not the container) ensure fast drags outside the container keep tracking.
+- `if (activeTool) return` guard means all annotation tools work exactly as before.
+
+---
+
+**Previous Session Summary (March 26, 2026 — Phase 1.7 complete — Docker, Print, polish)**
 
 **What we did:** Completed Phase 1.7. Cleaned up all Adobe/Acrobat user-facing references, added a working Print button, fixed Docker networking, fixed the PDF print function (it was printing the KindPDF UI instead of the document), added Ctrl+P interception, and fixed a horizontal scroll bug at high zoom levels.
 
@@ -330,7 +383,31 @@ for textboxes created elsewhere.
 
 **Phase 1 is fully complete. All MVP features and Docker deployment are done.**
 
-**Suggested first task for Phase 2: PWA support**
+**Viewer UX polish completed this session:** Ctrl+Scroll zoom and pan/grab-and-drag are both working.
+
+**URGENT carry-over task: Fix Docker CSS (Tailwind styles missing in Docker build) — NOT YET FIXED**
+
+The CSS file in the Docker container is 26KB (should be 200–400KB). Tailwind is running but not including utility classes. See the full issue description and list of already-tried fixes in the "What Is NOT Working" section above — **do not repeat any of those fixes**.
+
+**Start the next session by running this diagnostic first:**
+```powershell
+# Check if ANY Tailwind utility classes made it into the CSS file
+docker exec kindpdf-frontend grep -c "bg-blue" /usr/share/nginx/html/static/css/main.*.css
+```
+- Result `0` → Tailwind found zero classes. Content scanning is completely broken.
+- Result `> 0` → Some classes are there. The issue may be more subtle.
+
+Then run a local build to check if the problem is Docker-specific or universal:
+```powershell
+cd C:\Users\newte\OneDrive\SteveM\SteveMDocs\Personal\Personal\AI Program\KindPDF\frontend
+npm run build
+# Then check the size of build/static/css/main.*.css
+dir build\static\css\
+```
+- If local build also produces ~26KB → problem is NOT Docker-specific; it's a Tailwind config / react-scripts 5 compatibility issue
+- If local build produces 200KB+ → problem IS Docker-specific; the `.dockerignore` and other fixes haven't taken effect properly
+
+**Suggested second task for Phase 2: PWA support**
 
 Adding PWA (Progressive Web App) support is a high-impact, low-effort win that makes the app feel like a native desktop application. It is a good first step before adding accounts or cloud features because it requires no backend changes.
 
@@ -351,6 +428,8 @@ After PWA, the likely Phase 2 order is:
 
 | Date | What Was Accomplished |
 |---|---|
+| March 30, 2026 (s2) | Ctrl+Scroll zoom fix (useEffect dep `[]`→`[pdfDoc]` — ref was null on first render due to loading spinner early return); pan/grab-and-drag (isPanning state, getCursor grab/grabbing, handlePanMouseDown with global window listeners) |
+| March 30, 2026 | Docker CSS debugging session — issue still unresolved. Four fixes applied (nginx.conf MIME type split, package.json devDeps→deps, Dockerfile NODE_ENV=development, frontend/.dockerignore created) — none fixed the 26KB CSS output. See "What Is NOT Working" for full details and next diagnostic steps. |
 | March 26, 2026 | Phase 1.7 complete: Docker (backend/Dockerfile, frontend/Dockerfile, nginx.conf, docker-compose.yml, README.md); nginx /api/ proxy + .mjs MIME type + 50MB upload limit; all 11 localhost:5000 URLs replaced with relative paths; Adobe/Acrobat text purged from UI; Print button (blob iframe — prints PDF not UI); Ctrl+P interception; horizontal scroll fix at high zoom (min-w-max) |
 | March 25, 2026 | Phase 1.4 extension: PDF push-button overlay (ButtonOverlay.js, handleButtonClick, honest action modal); backend /api/form-fields extended to return buttons array |
 | March 25, 2026 | Phase 1.4 (Form Filling) + Phase 1.6 (Password Protection) + editable zoom input; FormOverlay.js, PasswordModal.js, backend /api/form-fields, /api/save-form, /api/protect-pdf, /api/unlock-pdf |
@@ -390,6 +469,8 @@ After PWA, the likely Phase 2 order is:
 | Sticky notes saved as native PDF annotations | Enables real interactivity in Acrobat/Preview; flat drawn boxes were dead graphics |
 | Highlight merge at save time only | Frontend keeps individual objects for undo granularity; merge only when writing to PDF |
 | Blob URL iframe for Print | `window.print()` and `iframe.src = relativeUrl` both printed the React UI. Fetching the PDF as a blob and using `URL.createObjectURL` guarantees Chrome's PDF plugin renders it inside the iframe |
+| Ctrl+Scroll useEffect dep `[pdfDoc]` not `[]` | Component renders a loading spinner (early return) on first mount — `scrollContainerRef.current` is null at that point. `[pdfDoc]` ensures the wheel listener is attached after the PDF loads and the scroll container is in the DOM |
+| Pan uses global window listeners | Registering mousemove/mouseup on `window` inside the mousedown handler (and removing them on mouseup) is the standard pattern for drag — keeps tracking even when the cursor moves outside the scroll container at speed |
 | Ctrl+P intercepted at window level | Mirrors Ctrl+F approach — Chrome's native Ctrl+P prints the page, not the PDF |
 | All API calls use relative paths | Hardcoded localhost:5000 breaks Docker (no host networking). Relative `/api/...` paths work in both dev (CRA proxy) and Docker (nginx proxy) |
 | nginx .mjs MIME type inline in location block | nginx rejects `include` inside a server-level `types {}` block. Must be placed inside the specific `location` block that serves the file |

@@ -16,7 +16,12 @@ WORKDIR /app
 # reruns when package.json or package-lock.json actually changes.
 COPY package.json package-lock.json* ./
 
-RUN npm ci --silent
+# NODE_ENV=development ensures npm always installs ALL dependencies,
+# including tailwindcss, postcss, and autoprefixer which are required
+# at build time to compile Tailwind CSS. If NODE_ENV=production (the
+# default in many Docker/CI environments), npm silently skips devDeps
+# and the build produces an empty CSS file with no Tailwind styles.
+RUN NODE_ENV=development npm ci --silent
 
 # Copy the rest of the source and build.
 # DISABLE_ESLINT_PLUGIN=true skips lint errors that would abort the build.
